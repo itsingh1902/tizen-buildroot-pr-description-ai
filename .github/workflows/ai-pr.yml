@@ -1,8 +1,7 @@
 name: AI Batching PR Description (OpenAI - Modular)
 on:
-  push:
-    branches:
-        - ai-pr-description
+  pull_request:
+    types: [opened, synchronize]
 
 jobs:
   generate_pr_description:
