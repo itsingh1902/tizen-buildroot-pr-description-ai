@@ -280,7 +280,7 @@ jobs:
             error_msg=$(echo "$response" | jq -r '.error.message')
             echo "❌ OpenAI API error for code review: $error_msg"
           elif echo "$response" | jq -e '.choices[0].message.content' > /dev/null 2>&1; then
-            review_text=$(echo "$response" | jq -r '.choices.message.content')
+            review_text=$(echo "$response" | jq -r '.choices[0].message.content')
             echo "# 🤖 AI-Generated Code Review" > AI_PR_Code_Review.md
             echo "" >> AI_PR_Code_Review.md
             echo "$review_text" >> AI_PR_Code_Review.md
@@ -317,7 +317,7 @@ jobs:
             error_msg=$(echo "$response" | jq -r '.error.message')
             echo "❌ OpenAI API error for test scenarios: $error_msg"
           elif echo "$response" | jq -e '.choices[0].message.content' > /dev/null 2>&1; then
-            test_text=$(echo "$response" | jq -r '.choices.message.content')
+            test_text=$(echo "$response" | jq -r '.choices[0].message.content')
             echo "# 🧪 AI-Generated Test Case Scenarios" > AI_Test_Case_Scenarios.md
             echo "" >> AI_Test_Case_Scenarios.md
             echo "$test_text" >> AI_Test_Case_Scenarios.md
@@ -368,7 +368,7 @@ jobs:
             sed '/^Test case scenarios:/d' | \
             sed '/^• 🤖 Code Review Analysis$/d' | \
             sed '/^• 🧪 Test Case Scenarios$/d' | \
-            sed '/^\*Files available for [0-9]* days\*$/d' | \
+            sed '/^\*Files available for [0-9][0-9]* days\*$/d' | \
             sed '/^---$/d' | \
             sed 's/[[:space:]]*$//')
 
@@ -392,11 +392,28 @@ jobs:
           echo "Updating PR body with AI-generated content and artifact links..."
 
           # Create the AI section with artifact links
-          ai_section="## 🤖 AI-Generated PR Description\n\n${PR_DESCRIPTION}\n\n---\n\n📁 **AI-Generated Files:** [Download from Workflow Artifacts](${{ steps.artifact_info.outputs.ARTIFACT_URL }})\n\n• 🤖 Code Review Analysis\n• 🧪 Test Case Scenarios\n\n*Files available for 30 days*"
+          echo "## 🤖 AI-Generated PR Description" > ai_section.txt
+          echo "" >> ai_section.txt
+          echo "${PR_DESCRIPTION}" >> ai_section.txt
+          echo "" >> ai_section.txt
+          echo "---" >> ai_section.txt
+          echo "" >> ai_section.txt
+          echo "📁 **AI-Generated Files:** [Download from Workflow Artifacts](${{ steps.artifact_info.outputs.ARTIFACT_URL }})" >> ai_section.txt
+          echo "" >> ai_section.txt
+          echo "• 🤖 Code Review Analysis" >> ai_section.txt
+          echo "• 🧪 Test Case Scenarios" >> ai_section.txt
+          echo "" >> ai_section.txt
+          echo "*Files available for 30 days*" >> ai_section.txt
+          ai_section=$(cat ai_section.txt)
 
           # Combine with existing body (if any)
           if [[ -n "$CURRENT_BODY" && "$CURRENT_BODY" != "null" && -n "$(echo "$CURRENT_BODY" | tr -d '[:space:]')" ]]; then
-            new_body="${ai_section}\n\n---\n\n${CURRENT_BODY}"
+            echo "${ai_section}" > new_body.txt
+            echo "" >> new_body.txt
+            echo "---" >> new_body.txt
+            echo "" >> new_body.txt
+            echo "${CURRENT_BODY}" >> new_body.txt
+            new_body=$(cat new_body.txt)
           else
             new_body="$ai_section"
           fi
@@ -424,5 +441,5 @@ jobs:
         if: always() && steps.change_detection.outputs.has_changes == 'true'
         run: |
           echo "Cleaning up temporary files..."
-          rm -f diff.txt files_diff.json combined_diff.json batch_summaries.txt diff_batch_* AI_PR_Code_Review.md AI_Test_Case_Scenarios.md
+          rm -f diff.txt files_diff.json combined_diff.json batch_summaries.txt diff_batch_* AI_PR_Code_Review.md AI_Test_Case_Scenarios.md ai_section.txt new_body.txt
           echo "✅ Cleanup completed"
