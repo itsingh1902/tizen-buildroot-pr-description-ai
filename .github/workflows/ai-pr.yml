@@ -27,7 +27,7 @@ jobs:
         uses: actions/checkout@v4
         with:
           fetch-depth: 0
-          ref: ${{ github.head_ref }}  # Always checkout the PR branch to avoid detached HEAD
+          ref: ${{ github.head_ref }} # Always checkout the PR branch to avoid detached HEAD
 
       - name: "Block 1.2: Validate environment variables"
         run: |
@@ -170,7 +170,7 @@ jobs:
                 -H "Authorization: Bearer $OPENAI_API_KEY" \
                 -d "$payload")
               if echo "$response" | jq -e '.choices[0].message.content' > /dev/null 2>&1; then
-                summary=$(echo "$response" | jq -r '.choices.message.content')
+                summary=$(echo "$response" | jq -r '.choices[0].message.content')
                 echo "✅ Batch $(basename "$batch") processed successfully"
                 echo "## Batch $(basename "$batch")" >> batch_summaries.txt
                 echo "$summary" >> batch_summaries.txt
@@ -222,7 +222,7 @@ jobs:
             -H "Authorization: Bearer $OPENAI_API_KEY" \
             -d "$payload")
           if echo "$response" | jq -e '.choices[0].message.content' > /dev/null 2>&1; then
-            pr_desc=$(echo "$response" | jq -r '.choices.message.content')
+            pr_desc=$(echo "$response" | jq -r '.choices[0].message.content')
             echo "✅ Final PR description generated successfully"
             echo "PR_DESCRIPTION<<EOF" >> $GITHUB_ENV
             echo "$pr_desc" >> $GITHUB_ENV
@@ -258,7 +258,7 @@ jobs:
             -H "Authorization: Bearer $OPENAI_API_KEY" \
             -d "$payload")
           if echo "$response" | jq -e '.choices[0].message.content' > /dev/null 2>&1; then
-            review_text=$(echo "$response" | jq -r '.choices.message.content')
+            review_text=$(echo "$response" | jq -r '.choices[0].message.content')
             echo "# 🤖 AI-Generated Code Review" > AI_PR_Code_Review.md
             echo "" >> AI_PR_Code_Review.md
             echo "$review_text" >> AI_PR_Code_Review.md
@@ -289,7 +289,7 @@ jobs:
             -H "Authorization: Bearer $OPENAI_API_KEY" \
             -d "$payload")
           if echo "$response" | jq -e '.choices[0].message.content' > /dev/null 2>&1; then
-            test_text=$(echo "$response" | jq -r '.choices.message.content')
+            test_text=$(echo "$response" | jq -r '.choices[0].message.content')
             echo "# 🧪 AI-Generated Test Case Scenarios" > AI_Test_Case_Scenarios.md
             echo "" >> AI_Test_Case_Scenarios.md
             echo "$test_text" >> AI_Test_Case_Scenarios.md
@@ -308,7 +308,7 @@ jobs:
           echo "Committing and pushing AI-generated files..."
           git config user.email "github-actions[bot]@users.noreply.github.com"
           git config user.name "github-actions[bot]"
-          
+
           # Check if files exist before adding
           if [ -f "AI_PR_Code_Review.md" ] && [ -f "AI_Test_Case_Scenarios.md" ]; then
             git add AI_PR_Code_Review.md AI_Test_Case_Scenarios.md
@@ -348,14 +348,14 @@ jobs:
           current_body=$(curl -s -H "Authorization: Bearer $GITHUB_TOKEN" \
             -H "Accept: application/vnd.github+json" \
             "https://api.github.com/repos/$GITHUB_REPO/pulls/$GITHUB_PR_NUMBER" | jq -r '.body // ""')
-          
+
           # Remove any existing AI-generated content to avoid duplication
           cleaned_body=$(echo "$current_body" | sed '/^## 🤖 AI-Generated PR Description$/,$d' | sed '/^PR Code review link:/d' | sed '/^Test case scenarios:/d' | sed '/^---$/d' | sed 's/[[:space:]]*$//')
-          
+
           echo "CURRENT_BODY<<EOF" >> $GITHUB_ENV
           echo "$cleaned_body" >> $GITHUB_ENV
           echo "EOF" >> $GITHUB_ENV
-          
+
           if [[ -n "$cleaned_body" && "$cleaned_body" != "null" ]]; then
             echo "✅ Existing PR body found and cleaned ($(echo "$cleaned_body" | wc -c) characters)"
           else
@@ -367,17 +367,17 @@ jobs:
         run: |
           set -e
           echo "Updating PR body with AI-generated description and file links..."
-          
+
           # Create the AI section with links
           ai_section="## 🤖 AI-Generated PR Description\n\n${PR_DESCRIPTION}\n\n---\n\nPR Code review link: [AI_PR_Code_Review.md](${{ steps.make_links.outputs.REVIEW_FILE_URL }})\nTest case scenarios: [AI_Test_Case_Scenarios.md](${{ steps.make_links.outputs.TEST_FILE_URL }})"
-          
+
           # Combine with existing body (if any)
           if [[ -n "$CURRENT_BODY" && "$CURRENT_BODY" != "null" && -n "$(echo "$CURRENT_BODY" | tr -d '[:space:]')" ]]; then
             new_body="${ai_section}\n\n---\n\n${CURRENT_BODY}"
           else
             new_body="$ai_section"
           fi
-          
+
           # Update PR with proper JSON escaping
           new_body_json=$(jq -Rs . <<< "$new_body")
           response=$(curl -s -X PATCH "https://api.github.com/repos/$GITHUB_REPO/pulls/$GITHUB_PR_NUMBER" \
@@ -385,7 +385,7 @@ jobs:
             -H "Accept: application/vnd.github+json" \
             -H "Content-Type: application/json" \
             -d "{\"body\": $new_body_json}")
-          
+
           if echo "$response" | jq -e '.id' > /dev/null 2>&1; then
             echo "✅ PR body updated successfully"
           else
