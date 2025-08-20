@@ -180,7 +180,7 @@ jobs:
               
               # Check if response has choices
               if echo "$response" | jq -e '.choices[0].message.content' > /dev/null 2>&1; then
-                summary=$(echo "$response" | jq -r '.choices.message.content')
+                summary=$(echo "$response" | jq -r '.choices[0].message.content')
                 echo "✅ Batch $(basename "$batch") processed successfully"
                 echo "## Batch $(basename "$batch")" >> batch_summaries.txt
                 echo "$summary" >> batch_summaries.txt
@@ -231,14 +231,14 @@ jobs:
             -H "Content-Type: application/json" \
             -H "Authorization: Bearer $OPENAI_API_KEY" \
             -d "$payload")
-          
+
           # Check for errors first
           if echo "$response" | jq -e '.error' > /dev/null 2>&1; then
             error_msg=$(echo "$response" | jq -r '.error.message')
             echo "❌ OpenAI API error for final description: $error_msg"
             echo "FINAL_DESCRIPTION_READY=false" >> $GITHUB_ENV
           elif echo "$response" | jq -e '.choices[0].message.content' > /dev/null 2>&1; then
-            pr_desc=$(echo "$response" | jq -r '.choices.message.content')
+            pr_desc=$(echo "$response" | jq -r '.choices[0].message.content')
             echo "✅ Final PR description generated successfully"
             echo "PR_DESCRIPTION<<EOF" >> $GITHUB_ENV
             echo "$pr_desc" >> $GITHUB_ENV
@@ -269,12 +269,12 @@ jobs:
               max_tokens: 500,
               temperature: 0.2
             }')
-          
+
           response=$(curl -s "https://api.openai.com/v1/chat/completions" \
             -H "Content-Type: application/json" \
             -H "Authorization: Bearer $OPENAI_API_KEY" \
             -d "$payload")
-          
+
           # Check for errors first
           if echo "$response" | jq -e '.error' > /dev/null 2>&1; then
             error_msg=$(echo "$response" | jq -r '.error.message')
@@ -306,12 +306,12 @@ jobs:
               max_tokens: 500,
               temperature: 0.2
             }')
-          
+
           response=$(curl -s "https://api.openai.com/v1/chat/completions" \
             -H "Content-Type: application/json" \
             -H "Authorization: Bearer $OPENAI_API_KEY" \
             -d "$payload")
-          
+
           # Check for errors first
           if echo "$response" | jq -e '.error' > /dev/null 2>&1; then
             error_msg=$(echo "$response" | jq -r '.error.message')
@@ -359,7 +359,7 @@ jobs:
           current_body=$(curl -s -H "Authorization: Bearer $GITHUB_TOKEN" \
             -H "Accept: application/vnd.github+json" \
             "https://api.github.com/repos/$GITHUB_REPO/pulls/$GITHUB_PR_NUMBER" | jq -r '.body // ""')
-          
+
           # Enhanced cleaning: Remove ALL AI-generated content patterns
           cleaned_body=$(echo "$current_body" | \
             sed '/^## 🤖 AI-Generated PR Description$/,$d' | \
@@ -371,14 +371,14 @@ jobs:
             sed '/^\*Files available for [0-9]* days\*$/d' | \
             sed '/^---$/d' | \
             sed 's/[[:space:]]*$//')
-          
+
           # Remove empty lines at the end
           cleaned_body=$(echo "$cleaned_body" | sed -e :a -e '/^\s*$/d;N;ba')
-          
+
           echo "CURRENT_BODY<<EOF" >> $GITHUB_ENV
           echo "$cleaned_body" >> $GITHUB_ENV
           echo "EOF" >> $GITHUB_ENV
-          
+
           if [[ -n "$cleaned_body" && "$cleaned_body" != "null" ]]; then
             echo "✅ Existing PR body found and cleaned ($(echo "$cleaned_body" | wc -c) characters)"
           else
@@ -390,17 +390,17 @@ jobs:
         run: |
           set -e
           echo "Updating PR body with AI-generated content and artifact links..."
-          
+
           # Create the AI section with artifact links
           ai_section="## 🤖 AI-Generated PR Description\n\n${PR_DESCRIPTION}\n\n---\n\n📁 **AI-Generated Files:** [Download from Workflow Artifacts](${{ steps.artifact_info.outputs.ARTIFACT_URL }})\n\n• 🤖 Code Review Analysis\n• 🧪 Test Case Scenarios\n\n*Files available for 30 days*"
-          
+
           # Combine with existing body (if any)
           if [[ -n "$CURRENT_BODY" && "$CURRENT_BODY" != "null" && -n "$(echo "$CURRENT_BODY" | tr -d '[:space:]')" ]]; then
             new_body="${ai_section}\n\n---\n\n${CURRENT_BODY}"
           else
             new_body="$ai_section"
           fi
-          
+
           # Update PR with proper JSON escaping
           new_body_json=$(jq -Rs . <<< "$new_body")
           response=$(curl -s -X PATCH "https://api.github.com/repos/$GITHUB_REPO/pulls/$GITHUB_PR_NUMBER" \
@@ -408,7 +408,7 @@ jobs:
             -H "Accept: application/vnd.github+json" \
             -H "Content-Type: application/json" \
             -d "{\"body\": $new_body_json}")
-          
+
           if echo "$response" | jq -e '.id' > /dev/null 2>&1; then
             echo "✅ PR body updated successfully with artifact links"
           else
