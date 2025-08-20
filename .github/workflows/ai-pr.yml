@@ -155,23 +155,26 @@ jobs:
           for batch in diff_batch_*; do
             if [ -s "$batch" ]; then
               echo "Processing batch: $(basename "$batch")"
-              
+
               # Properly escape diff content for JSON
-              diff_content=$(cat "$batch" | jq -Rs .)
-              
+              diff_content=$(cat "$batch")
+              payload=$(jq -n \
+                --arg diff "$diff_content" \
+                '{
+                  model: "gpt-4o-mini",
+                  messages: [
+                    {role: "system", content: "You are a helpful assistant that summarizes git diffs for pull request descriptions. Focus on the key changes and their purpose."},
+                    {role: "user", content: ("Summarize this git diff batch for a PR description:\n" + $diff)}
+                  ],
+                  max_tokens: 300,
+                  temperature: 0.2
+                }')
+
               response=$(curl -s "https://api.openai.com/v1/chat/completions" \
                 -H "Content-Type: application/json" \
                 -H "Authorization: Bearer $OPENAI_API_KEY" \
-                -d "{
-                  \"model\": \"gpt-4o-mini\",
-                  \"messages\": [
-                    {\"role\": \"system\", \"content\": \"You are a helpful assistant that summarizes git diffs for pull request descriptions. Focus on the key changes and their purpose.\"},
-                    {\"role\": \"user\", \"content\": \"Summarize this git diff batch for a PR description:\\n\" + $diff_content}
-                  ],
-                  \"max_tokens\": 300,
-                  \"temperature\": 0.2
-                }")
-              
+                -d "$payload")
+
               if echo "$response" | jq -e '.choices[0].message.content' > /dev/null 2>&1; then
                 summary=$(echo "$response" | jq -r '.choices[0].message.content')
                 echo "✅ Batch $(basename "$batch") processed successfully"
@@ -210,21 +213,23 @@ jobs:
         run: |
           echo "Aggregating and rephrasing all summaries..."
 
-          # Properly escape full summary for JSON
-          full_summary=$(cat batch_summaries.txt | jq -Rs .)
+          full_summary=$(cat batch_summaries.txt)
+          payload=$(jq -n \
+            --arg summary "$full_summary" \
+            '{
+              model: "gpt-4o-mini",
+              messages: [
+                {role: "system", content: "You are a helpful assistant that creates concise, professional pull request descriptions. Combine and rephrase the provided summaries into a coherent, well-structured PR description."},
+                {role: "user", content: ("Please combine these batch summaries into a single, coherent PR description:\n" + $summary)}
+              ],
+              max_tokens: 400,
+              temperature: 0.3
+            }')
 
           response=$(curl -s "https://api.openai.com/v1/chat/completions" \
             -H "Content-Type: application/json" \
             -H "Authorization: Bearer $OPENAI_API_KEY" \
-            -d "{
-              \"model\": \"gpt-4o-mini\",
-              \"messages\": [
-                {\"role\": \"system\", \"content\": \"You are a helpful assistant that creates concise, professional pull request descriptions. Combine and rephrase the provided summaries into a coherent, well-structured PR description.\"},
-                {\"role\": \"user\", \"content\": \"Please combine these batch summaries into a single, coherent PR description:\\n\" + $full_summary}
-              ],
-              \"max_tokens\": 400,
-              \"temperature\": 0.3
-            }")
+            -d "$payload")
 
           if echo "$response" | jq -e '.choices[0].message.content' > /dev/null 2>&1; then
             pr_desc=$(echo "$response" | jq -r '.choices[0].message.content')
