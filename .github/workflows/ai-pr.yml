@@ -21,12 +21,13 @@ jobs:
         run: sudo apt-get update && sudo apt-get install -y jq
 
       # ========================================
-      # BLOCK 1: CODE CHECKOUT & VALIDATION
+      # BLOCK 1: CODE CHECKOUT & VALIDATION (FIXED)
       # ========================================
-      - name: "Block 1.1: Checkout repository"
+      - name: "Block 1.1: Checkout repository and set PR branch"
         uses: actions/checkout@v4
         with:
           fetch-depth: 0
+          ref: ${{ github.head_ref }}  # Always checkout the PR branch to avoid detached HEAD
 
       - name: "Block 1.2: Validate environment variables"
         run: |
@@ -169,7 +170,7 @@ jobs:
                 -H "Authorization: Bearer $OPENAI_API_KEY" \
                 -d "$payload")
               if echo "$response" | jq -e '.choices[0].message.content' > /dev/null 2>&1; then
-                  summary=$(echo "$response" | jq -r '.choices[0].message.content')
+                summary=$(echo "$response" | jq -r '.choices.message.content')
                 echo "✅ Batch $(basename "$batch") processed successfully"
                 echo "## Batch $(basename "$batch")" >> batch_summaries.txt
                 echo "$summary" >> batch_summaries.txt
@@ -221,7 +222,7 @@ jobs:
             -H "Authorization: Bearer $OPENAI_API_KEY" \
             -d "$payload")
           if echo "$response" | jq -e '.choices[0].message.content' > /dev/null 2>&1; then
-              pr_desc=$(echo "$response" | jq -r '.choices[0].message.content')
+            pr_desc=$(echo "$response" | jq -r '.choices.message.content')
             echo "✅ Final PR description generated successfully"
             echo "PR_DESCRIPTION<<EOF" >> $GITHUB_ENV
             echo "$pr_desc" >> $GITHUB_ENV
@@ -238,64 +239,95 @@ jobs:
       # ========================================
       - name: "Block 7B.1: Generate AI Code Review"
         if: steps.change_detection.outputs.has_changes == 'true'
-        id: ai_codereview
         run: |
+          echo "Generating AI Code Review..."
           diff_content=$(cat diff.txt)
           payload=$(jq -n \
             --arg diff "$diff_content" \
             '{
               model: "gpt-4o-mini",
               messages: [
-                {role: "system", content: "You are a strict senior code reviewer. Provide detailed review comments focusing on correctness, maintainability, performance, and potential improvements."},
-                {role: "user", content: ("Generate a code review for this diff:\n" + $diff)}
+                {role: "system", content: "You are a strict senior code reviewer. Provide detailed review comments focusing on correctness, maintainability, performance, and potential improvements. Format your response as a markdown document with clear sections."},
+                {role: "user", content: ("Generate a comprehensive code review for this diff:\n" + $diff)}
               ],
-              max_tokens: 400,
+              max_tokens: 500,
               temperature: 0.2
             }')
           response=$(curl -s "https://api.openai.com/v1/chat/completions" \
             -H "Content-Type: application/json" \
             -H "Authorization: Bearer $OPENAI_API_KEY" \
             -d "$payload")
-          review_text=$(echo "$response" | jq -r '.choices[0].message.content')
-          echo "$review_text" > AI_PR_Code_Review.md
+          if echo "$response" | jq -e '.choices[0].message.content' > /dev/null 2>&1; then
+            review_text=$(echo "$response" | jq -r '.choices.message.content')
+            echo "# 🤖 AI-Generated Code Review" > AI_PR_Code_Review.md
+            echo "" >> AI_PR_Code_Review.md
+            echo "$review_text" >> AI_PR_Code_Review.md
+            echo "✅ AI Code Review generated and written to file"
+          else
+            echo "❌ Failed to generate code review"
+            echo "Response: $response"
+          fi
 
       - name: "Block 7B.2: Generate AI Test Scenarios"
         if: steps.change_detection.outputs.has_changes == 'true'
-        id: ai_testcases
         run: |
+          echo "Generating AI Test Scenarios..."
           diff_content=$(cat diff.txt)
           payload=$(jq -n \
             --arg diff "$diff_content" \
             '{
               model: "gpt-4o-mini",
               messages: [
-                {role: "system", content: "You are a test architect. Based on the provided code changes, generate a set of high-quality test case scenarios covering unit tests, edge cases, integration points, and possible regressions."},
-                {role: "user", content: ("Generate test case scenarios for this diff:\n" + $diff)}
+                {role: "system", content: "You are a test architect. Based on the provided code changes, generate a comprehensive set of test case scenarios covering unit tests, edge cases, integration points, and possible regressions. Format your response as a markdown document with clear sections and bullet points."},
+                {role: "user", content: ("Generate detailed test case scenarios for this diff:\n" + $diff)}
               ],
-              max_tokens: 400,
+              max_tokens: 500,
               temperature: 0.2
             }')
           response=$(curl -s "https://api.openai.com/v1/chat/completions" \
             -H "Content-Type: application/json" \
             -H "Authorization: Bearer $OPENAI_API_KEY" \
             -d "$payload")
-          test_text=$(echo "$response" | jq -r '.choices[0].message.content')
-          echo "$test_text" > AI_Test_Case_Scenarios.md
+          if echo "$response" | jq -e '.choices[0].message.content' > /dev/null 2>&1; then
+            test_text=$(echo "$response" | jq -r '.choices.message.content')
+            echo "# 🧪 AI-Generated Test Case Scenarios" > AI_Test_Case_Scenarios.md
+            echo "" >> AI_Test_Case_Scenarios.md
+            echo "$test_text" >> AI_Test_Case_Scenarios.md
+            echo "✅ AI Test Scenarios generated and written to file"
+          else
+            echo "❌ Failed to generate test scenarios"
+            echo "Response: $response"
+          fi
 
+      # ========================================
+      # BLOCK 7C: COMMIT AND PUSH FILES (FIXED)
+      # ========================================
       - name: "Block 7C: Commit and push AI-generated files"
         if: steps.change_detection.outputs.has_changes == 'true'
         run: |
+          echo "Committing and pushing AI-generated files..."
           git config user.email "github-actions[bot]@users.noreply.github.com"
           git config user.name "github-actions[bot]"
-          git add AI_PR_Code_Review.md AI_Test_Case_Scenarios.md
-          git commit -m "chore(ai): add AI code review and test scenarios [skip ci]" || echo "No changes to commit"
-          git push
+          
+          # Check if files exist before adding
+          if [ -f "AI_PR_Code_Review.md" ] && [ -f "AI_Test_Case_Scenarios.md" ]; then
+            git add AI_PR_Code_Review.md AI_Test_Case_Scenarios.md
+            if git diff --staged --quiet; then
+              echo "No changes to commit (files are identical)"
+            else
+              git commit -m "chore(ai): update AI code review and test scenarios [skip ci]"
+              git push  # Simple push works because we're on the branch
+              echo "✅ AI files committed and pushed successfully"
+            fi
+          else
+            echo "❌ AI files not found, skipping commit"
+          fi
 
       - name: "Block 7D: Get PR Head Branch Name"
         if: steps.change_detection.outputs.has_changes == 'true'
         id: getbranch
         run: |
-          echo "branch_name=${GITHUB_HEAD_REF:-${GITHUB_REF#refs/heads/}}" >> $GITHUB_OUTPUT
+          echo "branch_name=${{ github.head_ref }}" >> $GITHUB_OUTPUT  # Use github.head_ref directly
 
       - name: "Block 7E: Build URLs for AI files"
         if: steps.change_detection.outputs.has_changes == 'true'
@@ -307,7 +339,7 @@ jobs:
           echo "TEST_FILE_URL=https://github.com/$OWNER_REPO/blob/$BRANCH/AI_Test_Case_Scenarios.md" >> $GITHUB_OUTPUT
 
       # ========================================
-      # BLOCK 8: PR UPDATE & FINALIZATION (WITH LINKS)
+      # BLOCK 8: PR UPDATE & FINALIZATION (IMPROVED)
       # ========================================
       - name: "Block 8.1: Fetch current PR body"
         if: steps.change_detection.outputs.has_changes == 'true' && env.FINAL_DESCRIPTION_READY == 'true'
@@ -316,35 +348,48 @@ jobs:
           current_body=$(curl -s -H "Authorization: Bearer $GITHUB_TOKEN" \
             -H "Accept: application/vnd.github+json" \
             "https://api.github.com/repos/$GITHUB_REPO/pulls/$GITHUB_PR_NUMBER" | jq -r '.body // ""')
+          
+          # Remove any existing AI-generated content to avoid duplication
+          cleaned_body=$(echo "$current_body" | sed '/^## 🤖 AI-Generated PR Description$/,$d' | sed '/^PR Code review link:/d' | sed '/^Test case scenarios:/d' | sed '/^---$/d' | sed 's/[[:space:]]*$//')
+          
           echo "CURRENT_BODY<<EOF" >> $GITHUB_ENV
-          echo "$current_body" >> $GITHUB_ENV
+          echo "$cleaned_body" >> $GITHUB_ENV
           echo "EOF" >> $GITHUB_ENV
-          if [[ -n "$current_body" && "$current_body" != "null" ]]; then
-            echo "✅ Existing PR body found ($(echo "$current_body" | wc -c) characters)"
+          
+          if [[ -n "$cleaned_body" && "$cleaned_body" != "null" ]]; then
+            echo "✅ Existing PR body found and cleaned ($(echo "$cleaned_body" | wc -c) characters)"
           else
-            echo "ℹ️ No existing PR body"
+            echo "ℹ️ No existing PR body or empty after cleaning"
           fi
 
       - name: "Block 8.2: Update PR body with AI description and file links"
         if: steps.change_detection.outputs.has_changes == 'true' && env.FINAL_DESCRIPTION_READY == 'true'
         run: |
           set -e
-          link_section="PR Code review link: [AI_PR_Code_Review.md](${{ steps.make_links.outputs.REVIEW_FILE_URL }})\nTest case scenarios: [AI_Test_Case_Scenarios.md](${{ steps.make_links.outputs.TEST_FILE_URL }})"
-          if [[ -z "$CURRENT_BODY" || "$CURRENT_BODY" == "null" ]]; then
-            new_body="${PR_DESCRIPTION}\n\n---\n\n${link_section}"
+          echo "Updating PR body with AI-generated description and file links..."
+          
+          # Create the AI section with links
+          ai_section="## 🤖 AI-Generated PR Description\n\n${PR_DESCRIPTION}\n\n---\n\nPR Code review link: [AI_PR_Code_Review.md](${{ steps.make_links.outputs.REVIEW_FILE_URL }})\nTest case scenarios: [AI_Test_Case_Scenarios.md](${{ steps.make_links.outputs.TEST_FILE_URL }})"
+          
+          # Combine with existing body (if any)
+          if [[ -n "$CURRENT_BODY" && "$CURRENT_BODY" != "null" && -n "$(echo "$CURRENT_BODY" | tr -d '[:space:]')" ]]; then
+            new_body="${ai_section}\n\n---\n\n${CURRENT_BODY}"
           else
-            new_body="## 🤖 AI-Generated PR Description\n\n${PR_DESCRIPTION}\n\n---\n\n${link_section}\n\n---\n\n${CURRENT_BODY}"
+            new_body="$ai_section"
           fi
+          
+          # Update PR with proper JSON escaping
           new_body_json=$(jq -Rs . <<< "$new_body")
           response=$(curl -s -X PATCH "https://api.github.com/repos/$GITHUB_REPO/pulls/$GITHUB_PR_NUMBER" \
             -H "Authorization: Bearer $GITHUB_TOKEN" \
             -H "Accept: application/vnd.github+json" \
             -H "Content-Type: application/json" \
             -d "{\"body\": $new_body_json}")
+          
           if echo "$response" | jq -e '.id' > /dev/null 2>&1; then
-            echo "✅ PR updated successfully"
+            echo "✅ PR body updated successfully"
           else
-            echo "❌ Failed to update PR"
+            echo "❌ Failed to update PR body"
             echo "Response: $response"
             exit 1
           fi
