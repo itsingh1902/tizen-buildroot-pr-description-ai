@@ -247,6 +247,7 @@ jobs:
         env:
           JIRA_BASE_URL: https://cisco-sbg.atlassian.net
           JIRA_TOKEN: ${{ secrets.JIRA_PERSONAL_TOKEN }}
+          JIRA_EMAIL: itsingh@cisco.com # Your Cisco email for SAML authentication
         run: |
           # 1. Find first Jira key in PR title or branch name
           PR_TITLE="${{ github.event.pull_request.title }}"
@@ -260,7 +261,27 @@ jobs:
 
           echo "Found Jira key: $KEY"
 
-          # 2. Create a simple JSON comment for Jira
+          # 2. Test Jira API access first (using Basic Auth for SAML accounts)
+          echo "Testing Jira API access with SAML/SSO authentication..."
+          test_response=$(curl -s -w "%{http_code}" -X GET \
+            -u "$JIRA_EMAIL:$JIRA_TOKEN" \
+            -H "Content-Type: application/json" \
+            "$JIRA_BASE_URL/rest/api/3/issue/$KEY")
+
+          test_code="${test_response: -3}"
+          if [ "$test_code" != "200" ]; then
+            echo "❌ Cannot access Jira issue $KEY. HTTP code: $test_code"
+            echo "Response: ${test_response%???}"
+            echo "This could be due to:"
+            echo "- Invalid JIRA_PERSONAL_TOKEN"
+            echo "- Insufficient permissions for issue $KEY"
+            echo "- Issue $KEY doesn't exist"
+            echo "- SAML/SSO authentication issues"
+            exit 1
+          fi
+          echo "✅ Jira API access successful with SAML authentication"
+
+          # 3. Create a simple JSON comment for Jira
           # Build comment in separate parts to avoid shell escaping issues
           echo "GitHub PR Information:" > /tmp/comment.txt
           echo "- Repository: ${{ github.repository }}" >> /tmp/comment.txt
@@ -282,9 +303,9 @@ jobs:
           # 3. Convert to proper JSON using jq
           COMMENT_JSON=$(cat /tmp/comment.txt | jq -Rs '{body: {type: "doc", version: 1, content: [{type: "paragraph", content: [{type: "text", text: .}]}]}}')
 
-          # 4. Send to Jira
+          # 4. Send to Jira (using Basic Auth for SAML/SSO accounts)
           response=$(curl -s -w "%{http_code}" -X POST \
-            -H "Authorization: Bearer $JIRA_TOKEN" \
+            -u "$JIRA_EMAIL:$JIRA_TOKEN" \
             -H "Content-Type: application/json" \
             "$JIRA_BASE_URL/rest/api/3/issue/$KEY/comment" \
             -d "$COMMENT_JSON")
@@ -292,8 +313,15 @@ jobs:
           http_code="${response: -3}"
           if [ "$http_code" = "201" ]; then
             echo "✅ Successfully posted AI content to Jira issue $KEY"
+          elif [ "$http_code" = "403" ]; then
+            echo "❌ Access denied (403). Possible issues:"
+            echo "  - Invalid or expired API token"
+            echo "  - Insufficient permissions for issue $KEY"
+            echo "  - Project CSSCC access restricted"
+            echo "  - SAML/SSO authentication problems"
           else
             echo "❌ Failed to post to Jira. HTTP code: $http_code"
+            echo "Response body: ${response%???}"
           fi
 
       - name: Update PR body
