@@ -245,8 +245,8 @@ jobs:
       - name: Extract Jira issue key and comment on Jira
         if: steps.change_detection.outputs.has_changes == 'true'
         env:
-          JIRA_BASE_URL: https://cisco-sbg.atlassian.net # <— your Jira URL
-          JIRA_TOKEN: ${{ secrets.JIRA_PERSONAL_TOKEN }} # <— your personal access token
+          JIRA_BASE_URL: https://cisco-sbg.atlassian.net
+          JIRA_TOKEN: ${{ secrets.JIRA_PERSONAL_TOKEN }}
         run: |
           # 1. Find first Jira key in PR title or branch name
           PR_TITLE="${{ github.event.pull_request.title }}"
@@ -258,46 +258,28 @@ jobs:
             exit 0
           fi
 
-          # 2. Build the Jira comment body (using Jira markup)
-          COMMENT="h3. 🔗 GitHub PR #${{ github.event.pull_request.number }}
-          *Repository:* ${{ github.repository }}
-          *Title:* $PR_TITLE
-          *Link:* [View on GitHub|${{ github.event.pull_request.html_url }}]
+          echo "Found Jira key: $KEY"
 
-          h4. 🤖 AI Generated Description
-          ${{ env.PR_DESCRIPTION }}
+          # 2. Build comment text (escape for JSON)
+          PR_DESC=$(echo '${{ env.PR_DESCRIPTION }}' | jq -Rs .)
+          TEST_SCENARIOS=$(echo '${{ env.AI_TEST_SCENARIOS }}' | jq -Rs .)
+          CODE_REVIEW=$(echo '${{ env.AI_CODE_REVIEW }}' | jq -Rs .)
 
-          h4. 🧪 Test Scenarios
-          ${{ env.AI_TEST_SCENARIOS }}
+          FULL_COMMENT="GitHub PR Information:\n- Repository: ${{ github.repository }}\n- PR Number: #${{ github.event.pull_request.number }}\n- Title: ${{ github.event.pull_request.title }}\n- Link: ${{ github.event.pull_request.html_url }}\n\nAI Generated Description:\n${PR_DESC}\n\nTest Scenarios:\n${TEST_SCENARIOS}\n\nCode Review Notes:\n${CODE_REVIEW}\n\nComment automatically posted by GitHub Actions"
 
-          h4. 🔍 Code Review Notes
-          ${{ env.AI_CODE_REVIEW }}
-
-          _Comment automatically posted by GitHub Actions_"
-
-          # 3. Send comment to Jira using API v3 format
-          ESCAPED_COMMENT=$(echo "$COMMENT" | sed 's/"/\\"/g' | tr '\n' '\\n')
-
-          curl -s -X POST \
+          # 3. Send to Jira (using simple text format)
+          response=$(curl -s -w "%{http_code}" -X POST \
             -H "Authorization: Bearer $JIRA_TOKEN" \
             -H "Content-Type: application/json" \
             "$JIRA_BASE_URL/rest/api/3/issue/$KEY/comment" \
-            -d "{
-              \"body\": {
-                \"type\": \"doc\",
-                \"version\": 1,
-                \"content\": [
-                  {
-                    \"type\": \"paragraph\",
-                    \"content\": [
-                      { \"type\": \"text\", \"text\": \"$ESCAPED_COMMENT\" }
-                    ]
-                  }
-                ]
-              }
-            }"
+            -d "{\"body\":{\"type\":\"doc\",\"version\":1,\"content\":[{\"type\":\"paragraph\",\"content\":[{\"type\":\"text\",\"text\":\"$FULL_COMMENT\"}]}]}}")
 
-          echo "✅ Posted AI content to Jira issue $KEY"
+          http_code="${response: -3}"
+          if [ "$http_code" = "201" ]; then
+            echo "✅ Successfully posted AI content to Jira issue $KEY"
+          else
+            echo "❌ Failed to post to Jira. HTTP code: $http_code"
+          fi
 
       - name: Update PR body
         if: steps.change_detection.outputs.has_changes == 'true'
