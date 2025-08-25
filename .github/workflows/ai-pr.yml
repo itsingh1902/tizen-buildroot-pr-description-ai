@@ -17,7 +17,8 @@ jobs:
       - name: Install dependencies
         run: |
           sudo apt-get update
-          sudo apt-get install -y jq python3
+          sudo apt-get install -y jq
+          # Install GitHub CLI
           curl -fsSL https://cli.github.com/packages/githubcli-archive-keyring.gpg | sudo dd of=/usr/share/keyrings/githubcli-archive-keyring.gpg
           echo "deb [arch=$(dpkg --print-architecture) signed-by=/usr/share/keyrings/githubcli-archive-keyring.gpg] https://cli.github.com/packages stable main" | sudo tee /etc/apt/sources.list.d/github-cli.list > /dev/null
           sudo apt-get update
@@ -87,6 +88,7 @@ jobs:
               -H "Content-Type: application/json" \
               -H "Authorization: Bearer $OPENAI_API_KEY" \
               -d "{\"model\":\"gpt-4o-mini\",\"messages\":[{\"role\":\"system\",\"content\":\"You summarize git diffs for PR descriptions.\"},{\"role\":\"user\",\"content\":$escaped_content}],\"max_tokens\":300,\"temperature\":0.2}")
+            
             if echo "$response" | jq -e .choices > /dev/null 2>&1; then
               summary=$(echo "$response" | jq -r '.choices[0].message.content // ""')
               if [ -n "$summary" ]; then
@@ -124,12 +126,15 @@ jobs:
         run: |
           diff=$(cat diff.txt)
           escaped_diff=$(echo "$diff" | jq -Rs .)
+
           review=$(curl -s https://api.openai.com/v1/chat/completions \
             -H "Authorization: Bearer $OPENAI_API_KEY" -H "Content-Type: application/json" \
             -d "{\"model\":\"gpt-4o-mini\",\"messages\":[{\"role\":\"system\",\"content\":\"You are a strict senior code reviewer. Provide detailed review comments.\"},{\"role\":\"user\",\"content\":$escaped_diff}],\"max_tokens\":500,\"temperature\":0.2}")
+
           tests=$(curl -s https://api.openai.com/v1/chat/completions \
             -H "Authorization: Bearer $OPENAI_API_KEY" -H "Content-Type: application/json" \
             -d "{\"model\":\"gpt-4o-mini\",\"messages\":[{\"role\":\"system\",\"content\":\"You are a test architect. Provide test case scenarios.\"},{\"role\":\"user\",\"content\":$escaped_diff}],\"max_tokens\":500,\"temperature\":0.2}")
+
           review_text=$(echo "$review" | jq -r '.choices[0].message.content // ""')
           test_text=$(echo "$tests" | jq -r '.choices[0].message.content // ""')
           echo "AI_CODE_REVIEW<<EOF" >> $GITHUB_ENV
@@ -139,31 +144,41 @@ jobs:
           echo "$test_text" >> $GITHUB_ENV
           echo "EOF" >> $GITHUB_ENV
 
-      # ---- INLINE COMMENTS SECTION ----
-      - name: Generate AI Inline Comments with Modern API Parameters
+      # NEW: Generate inline comments for specific file changes
+      - name: Generate AI Inline Comments
         if: steps.change_detection.outputs.has_changes == 'true'
         run: |
           COMMIT_SHA="${{ github.event.pull_request.head.sha }}"
+          
+          # Create inline comments for each changed file
           echo "[]" > inline_comments.json
+          
           echo "$(cat files_diff.json)" | jq -r '.[] | select(.patch != null) | @base64' | while read -r file; do
             file_data=$(echo "$file" | base64 -d)
             filename=$(echo "$file_data" | jq -r '.filename')
             patch=$(echo "$file_data" | jq -r '.patch // ""')
+            
             if [ -n "$patch" ] && [ "$patch" != "null" ]; then
+              # Generate AI suggestions for this specific file
               escaped_patch=$(echo "$patch" | jq -Rs .)
+              
               ai_response=$(curl -s https://api.openai.com/v1/chat/completions \
                 -H "Authorization: Bearer $OPENAI_API_KEY" \
                 -H "Content-Type: application/json" \
                 -d "{
                   \"model\":\"gpt-4o-mini\",
                   \"messages\":[
-                    {\"role\":\"system\",\"content\":\"You are a code reviewer. Analyze the patch and identify specific issues. For each issue, return a JSON object with keys: path (file name), line (line number in NEW file), side ('RIGHT'), body (suggestion). Only comment on new/modified code (+ lines in patch). Return ONLY a JSON array.\"},
+                    {\"role\":\"system\",\"content\":\"You are a code reviewer. Analyze the patch and provide 1-3 specific inline suggestions. For each suggestion, identify the exact line number in the RIGHT side of the diff where the comment should be placed. Return ONLY a JSON array with objects containing: {\\\"path\\\": \\\"$filename\\\", \\\"line\\\": <line_number>, \\\"side\\\": \\\"RIGHT\\\", \\\"body\\\": \\\"<suggestion>\\\"}. Only suggest improvements for actual code changes, not context lines.\"},
                     {\"role\":\"user\",\"content\":$escaped_patch}
                   ],
-                  \"max_tokens\":500,
+                  \"max_tokens\":400,
                   \"temperature\":0.2
                 }")
+              
+              # Extract suggestions and add to comments array
               suggestions=$(echo "$ai_response" | jq -r '.choices[0].message.content // "[]"')
+              
+              # Validate JSON and merge with existing comments
               if echo "$suggestions" | jq empty 2>/dev/null; then
                 current_comments=$(cat inline_comments.json)
                 echo "$current_comments" | jq --argjson new "$suggestions" '. + $new' > inline_comments.json.tmp
@@ -172,51 +187,32 @@ jobs:
             fi
           done
 
+      # NEW: Create PR review with inline comments
       - name: Create PR Review with Inline Comments
         if: steps.change_detection.outputs.has_changes == 'true'
         run: |
           COMMIT_SHA="${{ github.event.pull_request.head.sha }}"
-          if [ ! -f "inline_comments.json" ]; then
-            echo "[]" > inline_comments.json
-          fi
+          
+          # Check if we have any inline comments
           comment_count=$(cat inline_comments.json | jq 'length')
-          echo "Found $comment_count inline comments to create"
+          
           if [ "$comment_count" -gt 0 ]; then
-            cat inline_comments.json | jq '.[] | select(.path and .line and .side and .body)' > validated_comments.json
-            validated_count=$(cat validated_comments.json | jq -s 'length')
-            echo "Validated $validated_count comments"
-            if [ "$validated_count" -gt 0 ]; then
-              review_body="🤖 **AI Code Review**\n\nI've analyzed your changes and provided $(cat validated_comments.json | jq -s 'length') specific inline suggestions below."
-              response=$(curl -s -X POST \
-                -H "Accept: application/vnd.github+json" \
-                -H "Authorization: Bearer $GITHUB_TOKEN" \
-                -H "X-GitHub-Api-Version: 2022-11-28" \
-                "https://api.github.com/repos/$GITHUB_REPO/pulls/$GITHUB_PR_NUMBER/reviews" \
-                -d "{
-                  \"commit_id\":\"$COMMIT_SHA\",
-                  \"body\":\"$review_body\",
-                  \"event\":\"COMMENT\",
-                  \"comments\":$(cat validated_comments.json | jq -s '.')
-                }")
-              if echo "$response" | jq -e '.id' > /dev/null 2>&1; then
-                review_id=$(echo "$response" | jq -r '.id')
-                echo "✅ Created PR review with ID: $review_id and $(cat validated_comments.json | jq -s 'length') inline comments"
-              else
-                echo "❌ Failed to create PR review"
-                echo "Response: $response" | jq '.'
-                echo "Attempting to create individual comments as fallback..."
-                cat validated_comments.json | jq -c '.[]' | while read -r comment; do
-                  curl -s -X POST \
-                    -H "Accept: application/vnd.github+json" \
-                    -H "Authorization: Bearer $GITHUB_TOKEN" \
-                    -H "X-GitHub-Api-Version: 2022-11-28" \
-                    "https://api.github.com/repos/$GITHUB_REPO/pulls/$GITHUB_PR_NUMBER/comments" \
-                    -d "$comment"
-                done
-              fi
-            else
-              echo "ℹ️ No valid inline comments to create"
-            fi
+            # Create review with inline comments
+            review_body="🤖 **AI Code Review**\n\nI've analyzed your changes and provided specific inline suggestions below."
+            
+            curl -s -X POST \
+              -H "Accept: application/vnd.github+json" \
+              -H "Authorization: Bearer $GITHUB_TOKEN" \
+              -H "X-GitHub-Api-Version: 2022-11-28" \
+              "https://api.github.com/repos/$GITHUB_REPO/pulls/$GITHUB_PR_NUMBER/reviews" \
+              -d "{
+                \"commit_id\":\"$COMMIT_SHA\",
+                \"body\":\"$review_body\",
+                \"event\":\"COMMENT\",
+                \"comments\":$(cat inline_comments.json)
+              }"
+            
+            echo "✅ Created PR review with $comment_count inline comments"
           else
             echo "ℹ️ No inline comments generated"
           fi
@@ -226,7 +222,16 @@ jobs:
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
-          COMMENT_BODY="### 🤖 AI Code Review\n\n$AI_CODE_REVIEW\n\n---\n\n### 🧪 AI Test Case Scenarios\n\n$AI_TEST_SCENARIOS"
+          COMMENT_BODY="### 🤖 AI Code Review
+
+          $AI_CODE_REVIEW
+
+          ---
+
+          ### 🧪 AI Test Case Scenarios
+
+          $AI_TEST_SCENARIOS"
+          # Find existing AI comment
           comment_id=$(gh api repos/${{ github.repository }}/issues/${{ github.event.pull_request.number }}/comments \
             -q ".[] | select(.user.login==\"github-actions[bot]\") | select(.body|startswith(\"### 🤖 AI Code Review\")) | .id")
           if [ -n "$comment_id" ]; then
@@ -235,16 +240,19 @@ jobs:
           else
             gh api repos/${{ github.repository }}/issues/${{ github.event.pull_request.number }}/comments \
               -F body="$COMMENT_BODY"
+          fi
 
       - name: Update PR body
         if: steps.change_detection.outputs.has_changes == 'true'
         run: |
+          # Fetch and clean existing body
           current=$(gh api repos/${{ github.repository }}/pulls/${{ github.event.pull_request.number }} -q .body)
           cleaned=$(echo "$current" | sed '/^## 🤖 AI/d')
+          # Use only new description
           gh api repos/${{ github.repository }}/pulls/${{ github.event.pull_request.number }} \
             -X PATCH \
             -F body="$PR_DESCRIPTION"
 
       - name: Cleanup temporary files
         if: always() && steps.change_detection.outputs.has_changes == 'true'
-        run: rm -f diff.txt files_diff.json combined_diff.json diff_batch_* batch_summaries.txt inline_comments.json inline_comments.json.tmp validated_comments.json
+        run: rm -f diff.txt files_diff.json combined_diff.json diff_batch_* batch_summaries.txt inline_comments.json inline_comments.json.tmp
