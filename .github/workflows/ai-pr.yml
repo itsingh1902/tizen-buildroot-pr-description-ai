@@ -260,19 +260,34 @@ jobs:
 
           echo "Found Jira key: $KEY"
 
-          # 2. Build comment text (escape for JSON)
-          PR_DESC=$(echo '${{ env.PR_DESCRIPTION }}' | jq -Rs .)
-          TEST_SCENARIOS=$(echo '${{ env.AI_TEST_SCENARIOS }}' | jq -Rs .)
-          CODE_REVIEW=$(echo '${{ env.AI_CODE_REVIEW }}' | jq -Rs .)
+          # 2. Create a simple JSON comment for Jira
+          # Build comment in separate parts to avoid shell escaping issues
+          echo "GitHub PR Information:" > /tmp/comment.txt
+          echo "- Repository: ${{ github.repository }}" >> /tmp/comment.txt
+          echo "- PR Number: #${{ github.event.pull_request.number }}" >> /tmp/comment.txt
+          echo "- Title: ${{ github.event.pull_request.title }}" >> /tmp/comment.txt
+          echo "- Link: ${{ github.event.pull_request.html_url }}" >> /tmp/comment.txt
+          echo "" >> /tmp/comment.txt
+          echo "AI Generated Description:" >> /tmp/comment.txt
+          echo "$PR_DESCRIPTION" >> /tmp/comment.txt
+          echo "" >> /tmp/comment.txt
+          echo "Test Scenarios:" >> /tmp/comment.txt
+          echo "$AI_TEST_SCENARIOS" >> /tmp/comment.txt
+          echo "" >> /tmp/comment.txt
+          echo "Code Review Notes:" >> /tmp/comment.txt
+          echo "$AI_CODE_REVIEW" >> /tmp/comment.txt
+          echo "" >> /tmp/comment.txt
+          echo "Comment automatically posted by GitHub Actions" >> /tmp/comment.txt
 
-          FULL_COMMENT="GitHub PR Information:\n- Repository: ${{ github.repository }}\n- PR Number: #${{ github.event.pull_request.number }}\n- Title: ${{ github.event.pull_request.title }}\n- Link: ${{ github.event.pull_request.html_url }}\n\nAI Generated Description:\n${PR_DESC}\n\nTest Scenarios:\n${TEST_SCENARIOS}\n\nCode Review Notes:\n${CODE_REVIEW}\n\nComment automatically posted by GitHub Actions"
+          # 3. Convert to proper JSON using jq
+          COMMENT_JSON=$(cat /tmp/comment.txt | jq -Rs '{body: {type: "doc", version: 1, content: [{type: "paragraph", content: [{type: "text", text: .}]}]}}')
 
-          # 3. Send to Jira (using simple text format)
+          # 4. Send to Jira
           response=$(curl -s -w "%{http_code}" -X POST \
             -H "Authorization: Bearer $JIRA_TOKEN" \
             -H "Content-Type: application/json" \
             "$JIRA_BASE_URL/rest/api/3/issue/$KEY/comment" \
-            -d "{\"body\":{\"type\":\"doc\",\"version\":1,\"content\":[{\"type\":\"paragraph\",\"content\":[{\"type\":\"text\",\"text\":\"$FULL_COMMENT\"}]}]}}")
+            -d "$COMMENT_JSON")
 
           http_code="${response: -3}"
           if [ "$http_code" = "201" ]; then
