@@ -281,7 +281,7 @@ jobs:
           fi
           echo "✅ Jira API access successful with SAML authentication"
 
-          # 3. Create a simple JSON comment for Jira
+          # 3. Create a simple JSON comment for Jira (excluding review comments)
           # Build comment in separate parts to avoid shell escaping issues
           echo "GitHub PR Information:" > /tmp/comment.txt
           echo "- Repository: ${{ github.repository }}" >> /tmp/comment.txt
@@ -294,9 +294,6 @@ jobs:
           echo "" >> /tmp/comment.txt
           echo "Test Scenarios:" >> /tmp/comment.txt
           echo "$AI_TEST_SCENARIOS" >> /tmp/comment.txt
-          echo "" >> /tmp/comment.txt
-          echo "Code Review Notes:" >> /tmp/comment.txt
-          echo "$AI_CODE_REVIEW" >> /tmp/comment.txt
           echo "" >> /tmp/comment.txt
           echo "Comment automatically posted by GitHub Actions" >> /tmp/comment.txt
 
