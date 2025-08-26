@@ -144,7 +144,7 @@ jobs:
           echo "$test_text" >> $GITHUB_ENV
           echo "EOF" >> $GITHUB_ENV
 
-      # NEW: Generate inline comments for specific file changes
+      # Generate inline comments for specific file changes
       - name: Generate AI Inline Comments
         if: steps.change_detection.outputs.has_changes == 'true'
         run: |
