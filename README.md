@@ -1,26 +1,44 @@
 tizen-buildroot
 ===============
 
-####Scripts preparing buildroot directory from scratch, used for Tizen system
+#### Scripts preparing buildroot directory from scratch, used for Tizen system
 
-1. Create "user_path_config.sh" and edit pathes there (see "user_path_config.example").
+## Prerequisites
+
+Before running the build scripts, ensure you have all required host tools installed.
+
+## Setup Instructions
+
+1. Create "user_path_config.sh" and edit paths there (see "user_path_config.example").
+
+## Build Process
 
 2. To create rootfs and build packages for required architecture:
 
-`./build_pkgs.sh mipsel`    
-`sudo ./prepare_rootfs.sh mipsel`    
-`sudo ./build_rpms.sh mipsel`    
+```bash
+./build_pkgs.sh mipsel    
+sudo ./prepare_rootfs.sh mipsel    
+sudo ./build_rpms.sh mipsel
+```
   
 You can specify which rpms need to build:
-`sudo ./build_rpms.sh mipsel "argp-standalone acl" `
+```bash
+sudo ./build_rpms.sh mipsel "argp-standalone acl"
+```
 
-Some required host tools:
+## Required Host Tools
 
 	help2man, flex, flex-devel, ncurses-devel, texinfo, texinfo-tex, gettext-devel, rcs, transfig, libtool, autoconf, automake, bison, gperf, libgpg-error-devel, libxml2-devel
 
-By default temporary build directory will be deleted, to save it you should set environment variable:     
- `export DONT_CLEAN=1 ` 
+## Environment Variables
+
+By default temporary build directory will be deleted. To preserve it, set:     
+```bash
+export DONT_CLEAN=1
+```
+
+## Important Notes
   
 *You should update macros.tizen-platform for new snapshot of Tizen (copy it from libtzplatform-config-devel-1.0-0.mipsel.rpm).*
               
-**Important:** the bash package v.4.3.30 is working incorrect in chroot, so currently using v.4.2.  
+**Important:** The bash package v.4.3.30 works incorrectly in chroot, so currently using v.4.2.  
