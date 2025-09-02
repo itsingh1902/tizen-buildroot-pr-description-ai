@@ -13,7 +13,7 @@ Before running the build scripts, ensure you have all required host tools instal
 
 ## Build Process
 
-2. To create rootfs and build packages for required architecture:
+2. To create rootfs and build packages for required architecture hellooo
 
 ```bash
 ./build_pkgs.sh mipsel    
