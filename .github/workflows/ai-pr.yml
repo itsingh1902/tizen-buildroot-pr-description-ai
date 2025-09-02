@@ -258,4 +258,40 @@ jobs:
           # Final validate inline_comments.json is an array of objects with required fields
           if ! jq -e 'type == "array" and (.[]
               | (.path? and .position? and .body?))' inline_comments.json >/dev/null 2>&1; then
-            echo "inline_comments_
+            echo "Invalid inline_comments.json format; resetting to empty array"
+            echo "[]" > inline_comments.json
+          fi
+
+      - name: Update PR description
+        if: steps.change_detection.outputs.has_changes == 'true'
+        run: |
+          gh pr edit "$GITHUB_PR_NUMBER" --body "$PR_DESCRIPTION" --repo "$GITHUB_REPO"
+
+      - name: Post inline comments (batch)
+        if: steps.change_detection.outputs.has_changes == 'true'
+        run: |
+          if [ -s inline_comments.json ] && [ "$(jq 'length' inline_comments.json)" -gt 0 ]; then
+            jq -c '.[]' inline_comments.json | while read -r comment; do
+              path=$(echo "$comment" | jq -r '.path')
+              position=$(echo "$comment" | jq -r '.position')
+              body=$(echo "$comment" | jq -r '.body')
+              
+              curl -s -X POST \
+                -H "Authorization: Bearer ${GITHUB_TOKEN}" \
+                -H "Accept: application/vnd.github.v3+json" \
+                "https://api.github.com/repos/${GITHUB_REPO}/pulls/${GITHUB_PR_NUMBER}/comments" \
+                -d "$(jq -n --arg path "$path" --arg position "$position" --arg body "$body" '{path: $path, position: ($position | tonumber), side: "RIGHT", body: $body}')" || true
+            done
+          else
+            echo "No inline comments to post"
+          fi
+
+      - name: Summary output
+        if: always()
+        run: |
+          echo "✅ AI PR description workflow completed"
+          echo "📊 Processed batches: ${PROCESSED_BATCHES:-0}/${BATCH_COUNT:-0}"
+          if [ -f inline_comments.json ]; then
+            comment_count=$(jq 'length' inline_comments.json 2>/dev/null || echo "0")
+            echo "💬 Generated inline comments: $comment_count"
+          fi
