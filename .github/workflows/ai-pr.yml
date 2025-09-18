@@ -1,0 +1,271 @@
+name: AI PR Description Generator
+
+on:
+  pull_request:
+    types: [opened, synchronize]
+
+concurrency:
+  group: ai-pr-description-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+  pull-requests: write
+  issues: write
+
+jobs:
+  generate_pr_description:
+    runs-on: ubuntu-latest
+    env:
+      OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+      GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      GITHUB_PR_NUMBER: ${{ github.event.pull_request.number }}
+      GITHUB_REPO: ${{ github.repository }}
+      BATCH_SIZE: 150
+
+    steps:
+      - name: Install dependencies
+        run: |
+          sudo apt-get update -y
+          sudo apt-get install -y jq curl git gh
+
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          ref: ${{ github.head_ref }}
+
+      - name: Validate environment variables
+        run: |
+          if [ -z "${OPENAI_API_KEY:-}" ]; then
+            echo "❌ OPENAI_API_KEY is not set"
+            exit 1
+          fi
+          if [ -z "${GITHUB_TOKEN:-}" ]; then
+            echo "❌ GITHUB_TOKEN is not set"
+            exit 1
+          fi
+
+      - name: Extract git diff
+        run: |
+          git diff "${{ github.event.pull_request.base.sha }}"..."${{ github.event.pull_request.head.sha }}" > diff.txt || true
+
+      - name: Check for meaningful changes
+        id: change_detection
+        run: |
+          if [ -s diff.txt ]; then
+            echo "has_changes=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "has_changes=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Split diff into batches
+        if: steps.change_detection.outputs.has_changes == 'true'
+        run: |
+          rm -f diff_batch_* || true
+          split -l "${BATCH_SIZE}" diff.txt diff_batch_ || true
+
+      - name: Generate batched summaries with OpenAI
+        if: steps.change_detection.outputs.has_changes == 'true'
+        run: |
+          rm -f batch_summaries.txt || true
+
+          for batch in diff_batch_*; do
+            [ -f "$batch" ] || continue
+            
+            diff_content=$(cat "$batch")
+            request=$(jq -n \
+              --arg model "gpt-4o-mini" \
+              --arg system "You summarize git diffs for PR descriptions. Focus on what changed and why it matters." \
+              --arg user "$diff_content" \
+              '{model:$model, messages:[{role:"system",content:$system},{role:"user",content:$user}], max_tokens:300, temperature:0.2}')
+            
+            response=$(curl -s --retry 2 --retry-delay 2 \
+              "https://api.openai.com/v1/chat/completions" \
+              -H "Content-Type: application/json" \
+              -H "Authorization: Bearer ${OPENAI_API_KEY}" \
+              -d "$request")
+            
+            if echo "$response" | jq -e .choices >/dev/null 2>&1; then
+              summary=$(echo "$response" | jq -r '.choices[0].message.content // ""')
+              if [ -n "$summary" ]; then
+                echo "## Batch $(basename "$batch")" >> batch_summaries.txt
+                echo "$summary" >> batch_summaries.txt
+                echo "" >> batch_summaries.txt
+              fi
+            fi
+          done
+
+      - name: Generate final PR description
+        if: steps.change_detection.outputs.has_changes == 'true'
+        run: |
+          full_summary=$(cat batch_summaries.txt 2>/dev/null || "")
+
+          system_prompt="You are a professional release engineer and technical writer. Given a collection of git-diff summaries, produce a concise, structured PR description. Output must include: 1) Short summary (1-2 lines), 2) Bullet list of changed areas/files, 3) Impact/risk (Low/Medium/High) with justification, 4) Testing notes and validation commands, 5) Suggested reviewers/teams. Keep it production-ready and concise."
+
+          request=$(jq -n \
+            --arg model "gpt-4o-mini" \
+            --arg system "$system_prompt" \
+            --arg user "$full_summary" \
+            '{model:$model, messages:[{role:"system",content:$system},{role:"user",content:$user}], max_tokens:400, temperature:0.2}')
+
+          response=$(curl -s --retry 2 --retry-delay 2 \
+            "https://api.openai.com/v1/chat/completions" \
+            -H "Content-Type: application/json" \
+            -H "Authorization: Bearer ${OPENAI_API_KEY}" \
+            -d "$request")
+
+          if echo "$response" | jq -e .choices >/dev/null 2>&1; then
+            pr_desc=$(echo "$response" | jq -r '.choices[0].message.content // ""')
+          else
+            pr_desc="Failed to generate PR description."
+          fi
+
+          echo 'PR_DESCRIPTION<<EOF' >> "$GITHUB_ENV"
+          echo "$pr_desc" >> "$GITHUB_ENV"
+          echo 'EOF' >> "$GITHUB_ENV"
+
+      - name: Generate test scenarios
+        if: steps.change_detection.outputs.has_changes == 'true'
+        run: |
+          diff_all=$(cat diff.txt 2>/dev/null || "")
+
+          tests_prompt="You are a test architect. From the provided git diff, produce prioritized test cases and steps to validate the changes, including boundary and negative cases. Focus on practical testing approaches."
+
+          request=$(jq -n \
+            --arg model "gpt-4o-mini" \
+            --arg system "$tests_prompt" \
+            --arg user "$diff_all" \
+            '{model:$model, messages:[{role:"system",content:$system},{role:"user",content:$user}], max_tokens:500, temperature:0.2}')
+
+          response=$(curl -s --retry 2 --retry-delay 2 \
+            "https://api.openai.com/v1/chat/completions" \
+            -H "Authorization: Bearer ${OPENAI_API_KEY}" \
+            -H "Content-Type: application/json" \
+            -d "$request")
+
+          test_text=$(echo "$response" | jq -r '.choices[0].message.content // ""')
+
+          echo 'AI_TEST_SCENARIOS<<EOF' >> "$GITHUB_ENV"
+          echo "$test_text" >> "$GITHUB_ENV"
+          echo 'EOF' >> "$GITHUB_ENV"
+
+      - name: Update PR description
+        if: steps.change_detection.outputs.has_changes == 'true'
+        run: |
+          gh api repos/${{ github.repository }}/pulls/${{ github.event.pull_request.number }} \
+            -X PATCH -F body="$PR_DESCRIPTION"
+
+      - name: Post test scenarios as PR comment
+        if: steps.change_detection.outputs.has_changes == 'true'
+        run: |
+          COMMENT_BODY=$(printf "### 🧪 AI Test Scenarios\n\n%s\n\n*This comment was generated automatically by AI to help with testing validation.*" "$AI_TEST_SCENARIOS")
+
+          existing=$(gh api repos/${{ github.repository }}/issues/${{ github.event.pull_request.number }}/comments \
+            --jq ".[] | select(.user.login==\"github-actions[bot]\") | select(.body|startswith(\"### 🧪 AI Test Scenarios\")) | .id" || true)
+
+          if [ -n "$existing" ]; then
+            gh api repos/${{ github.repository }}/issues/comments/$existing \
+              -X PATCH -F body="$COMMENT_BODY"
+          else
+            gh api repos/${{ github.repository }}/issues/${{ github.event.pull_request.number }}/comments \
+              -F body="$COMMENT_BODY"
+          fi
+
+      - name: Add PR description to Jira ticket
+        if: steps.change_detection.outputs.has_changes == 'true'
+        env:
+          JIRA_BASE_URL: https://cisco-sbg.atlassian.net
+          JIRA_TOKEN: ${{ secrets.JIRA_PERSONAL_TOKEN }}
+          JIRA_EMAIL: itsingh@cisco.com
+        run: |
+          PR_TITLE="${{ github.event.pull_request.title }}"
+          BRANCH="${{ github.head_ref }}"
+
+          # Extract Jira issue key from PR title or branch name
+          KEY=$(echo -e "${PR_TITLE}\n${BRANCH}" | grep -oE '[A-Z]{2,10}-[0-9]+' | head -1 || true)
+
+          if [ -z "$KEY" ]; then
+            echo "No Jira issue key found; skipping Jira update."
+            exit 0
+          fi
+
+          echo "Found Jira key: $KEY"
+
+          # Verify access to Jira issue
+          test_response=$(curl -s -w "%{http_code}" -X GET \
+            -u "$JIRA_EMAIL:$JIRA_TOKEN" \
+            -H "Content-Type: application/json" \
+            "$JIRA_BASE_URL/rest/api/3/issue/$KEY")
+          test_code="${test_response: -3}"
+
+          if [ "$test_code" != "200" ]; then
+            echo "❌ Cannot access Jira issue $KEY. HTTP code: $test_code"
+            exit 1
+          fi
+
+          echo "✅ Jira API access successful"
+
+          # Prepare comment content with proper environment variable substitution
+          cat > /tmp/jira_comment.txt << 'JIRAEOF'
+          ## GitHub PR Information
+          - **Repository:** GITHUB_REPO_PLACEHOLDER
+          - **PR Number:** #GITHUB_PR_NUMBER_PLACEHOLDER
+          - **Title:** GITHUB_PR_TITLE_PLACEHOLDER
+          - **Link:** GITHUB_PR_URL_PLACEHOLDER
+
+          ## AI Generated PR Description
+          PR_DESCRIPTION_PLACEHOLDER
+
+          ## Test Scenarios
+          AI_TEST_SCENARIOS_PLACEHOLDER
+
+          ---
+          *Comment automatically posted by GitHub Actions*
+          JIRAEOF
+
+          # Replace placeholders with actual values
+          sed -i "s/GITHUB_REPO_PLACEHOLDER/${{ github.repository }}/g" /tmp/jira_comment.txt
+          sed -i "s/GITHUB_PR_NUMBER_PLACEHOLDER/${{ github.event.pull_request.number }}/g" /tmp/jira_comment.txt
+          sed -i "s/GITHUB_PR_TITLE_PLACEHOLDER/${{ github.event.pull_request.title }}/g" /tmp/jira_comment.txt
+          sed -i "s|GITHUB_PR_URL_PLACEHOLDER|${{ github.event.pull_request.html_url }}|g" /tmp/jira_comment.txt
+
+          # Replace environment variables using a temporary script
+          cat > /tmp/replace_vars.sh << 'SCRIPTEOF'
+          #!/bin/bash
+          sed -i "s/PR_DESCRIPTION_PLACEHOLDER/${PR_DESCRIPTION//\//\\/}/g" /tmp/jira_comment.txt
+          sed -i "s/AI_TEST_SCENARIOS_PLACEHOLDER/${AI_TEST_SCENARIOS//\//\\/}/g" /tmp/jira_comment.txt
+          SCRIPTEOF
+          chmod +x /tmp/replace_vars.sh
+          /tmp/replace_vars.sh
+
+          # Create Jira comment
+          COMMENT_JSON=$(cat /tmp/jira_comment.txt | jq -Rs '{body: .}')
+
+          response=$(curl -s -w "%{http_code}" -X POST \
+            -u "$JIRA_EMAIL:$JIRA_TOKEN" \
+            -H "Content-Type: application/json" \
+            "$JIRA_BASE_URL/rest/api/3/issue/$KEY/comment" \
+            -d "$COMMENT_JSON")
+
+          http_code="${response: -3}"
+
+          if [ "$http_code" = "201" ]; then
+            echo "✅ Successfully posted AI content to Jira issue $KEY"
+          else
+            echo "❌ Failed to post to Jira. HTTP code: $http_code"
+            echo "$response"
+          fi
+
+      - name: Cleanup temporary files
+        if: always()
+        run: |
+          rm -f diff.txt diff_batch_* batch_summaries.txt /tmp/jira_comment.txt /tmp/replace_vars.sh || true
+
+      - name: Workflow summary
+        if: steps.change_detection.outputs.has_changes == 'true'
+        run: |
+          echo "🎉 AI PR Description Workflow Complete!"
+          echo "✅ PR Description: Updated"
+          echo "✅ Test Scenarios: Posted as comment"
+          echo "✅ Jira Integration: Attempted"
