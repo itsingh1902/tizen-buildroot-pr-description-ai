@@ -74,14 +74,16 @@ jobs:
             echo "⚠️  Endpoint response: $test_code"
           fi
 
-          # Function to generate Cisco access token
+          # Function to generate Cisco access token following official documentation
           generate_cisco_token() {
-            # Base64 encode the client credentials
+            echo "🔧 Generating Cisco access token..."
+            
+            # Base64 encode the client credentials as per documentation
             encoded_credentials=$(echo -n "${CISCO_CLIENT_ID}:${CISCO_CLIENT_SECRET}" | base64)
-            echo "🔧 Encoded credentials length: ${#encoded_credentials}"
+            echo "🔧 Encoded credentials prepared (length: ${#encoded_credentials})"
             
             echo "📤 Making OAuth request to Cisco..."
-            # Get access token from Cisco OAuth2 endpoint
+            # Get access token from Cisco OAuth2 endpoint using exact format from documentation
             response=$(curl -s --retry 3 --retry-delay 2 \
               --location --request POST 'https://id.cisco.com/oauth2/default/v1/token' \
               --header 'Accept: */*' \
@@ -103,8 +105,6 @@ jobs:
             
             if [ -z "$access_token" ] || [ "$access_token" = "null" ] || [ "$access_token" = "empty" ]; then
               echo "❌ Failed to obtain Cisco access token"
-              # Don't log the full response as it may contain sensitive data
-              echo "Response length: ${#response}"
               # Check if response contains error information
               if echo "$response" | jq -e '.error' >/dev/null 2>&1; then
                 echo "OAuth error: $(echo "$response" | jq -r '.error // "unknown"')"
@@ -117,56 +117,16 @@ jobs:
             echo "$access_token"
           }
 
-          # Function to make API call with token refresh
-          cisco_api_call() {
-            local endpoint="$1"
-            local request_data="$2"
-            local max_retries=2
-            local retry_count=0
-            
-            while [ $retry_count -lt $max_retries ]; do
-              response=$(curl -s --retry 2 --retry-delay 2 \
-                "$endpoint" \
-                -H "Content-Type: application/json" \
-                -H "Accept: application/json" \
-                -H "api-key: ${CISCO_ACCESS_TOKEN}" \
-                -d "$request_data")
-              
-              # Check if we got a valid response
-              if echo "$response" | jq -e .choices >/dev/null 2>&1; then
-                echo "$response"
-                return 0
-              fi
-              
-              # Check if it's an auth error and retry with new token
-              if echo "$response" | grep -q "401\|unauthorized\|invalid.*token"; then
-                echo "🔄 Token expired, refreshing..."
-                new_token=$(generate_cisco_token)
-                if [ $? -eq 0 ]; then
-                  export CISCO_ACCESS_TOKEN="$new_token"
-                  echo "CISCO_ACCESS_TOKEN=$new_token" >> "$GITHUB_ENV"
-                fi
-              fi
-              
-              retry_count=$((retry_count + 1))
-              echo "⚠️  API call failed, retry $retry_count/$max_retries"
-            done
-            
-            echo "$response"
-            return 1
-          }
-
           # Generate initial token
+          echo "🚀 Starting Cisco API authentication..."
           initial_token=$(generate_cisco_token)
           if [ $? -ne 0 ]; then
+            echo "❌ Failed to generate initial token"
             exit 1
           fi
 
           echo "✅ Successfully obtained Cisco access token"
           echo "CISCO_ACCESS_TOKEN=$initial_token" >> "$GITHUB_ENV"
-
-          # Export functions for later steps
-          echo 'generate_cisco_token() { encoded_credentials=$(echo -n "${CISCO_CLIENT_ID}:${CISCO_CLIENT_SECRET}" | base64); response=$(curl -s --retry 3 --retry-delay 2 --location --request POST "https://id.cisco.com/oauth2/default/v1/token" --header "Accept: */*" --header "Content-Type: application/x-www-form-urlencoded" --header "Authorization: Basic ${encoded_credentials}" --data-urlencode "grant_type=client_credentials"); if ! echo "$response" | jq . >/dev/null 2>&1; then echo "❌ Invalid JSON response"; return 1; fi; access_token=$(echo "$response" | jq -r ".access_token // empty"); if [ -z "$access_token" ] || [ "$access_token" = "null" ] || [ "$access_token" = "empty" ]; then echo "❌ Failed to obtain token"; return 1; fi; echo "$access_token"; }' >> "$GITHUB_ENV"
 
       - name: Extract git diff
         run: |
@@ -192,17 +152,68 @@ jobs:
         run: |
           rm -f batch_summaries.txt || true
 
+          # Function to refresh token if needed (tokens expire every hour)
+          refresh_token_if_needed() {
+            # Test current token
+            test_response=$(curl -s -w "%{http_code}" \
+              "https://chat-ai.cisco.com/openai/deployments/gpt-4o-mini/chat/completions" \
+              -H "Content-Type: application/json" \
+              -H "Accept: application/json" \
+              -H "api-key: ${CISCO_ACCESS_TOKEN}" \
+              -d '{"messages":[{"role":"user","content":"test"}],"user":"{\"appkey\":\"'${CISCO_APP_KEY}'\"}","max_tokens":1}' \
+              2>/dev/null || echo "000")
+            
+            test_code="${test_response: -3}"
+            if [ "$test_code" = "401" ] || [ "$test_code" = "403" ]; then
+              echo "🔄 Token expired, refreshing..."
+              # Generate new token using the same method
+              encoded_credentials=$(echo -n "${CISCO_CLIENT_ID}:${CISCO_CLIENT_SECRET}" | base64)
+              token_response=$(curl -s --retry 3 --retry-delay 2 \
+                --location --request POST 'https://id.cisco.com/oauth2/default/v1/token' \
+                --header 'Accept: */*' \
+                --header 'Content-Type: application/x-www-form-urlencoded' \
+                --header "Authorization: Basic ${encoded_credentials}" \
+                --data-urlencode 'grant_type=client_credentials')
+              
+              new_token=$(echo "$token_response" | jq -r '.access_token // empty')
+              if [ -n "$new_token" ] && [ "$new_token" != "null" ] && [ "$new_token" != "empty" ]; then
+                export CISCO_ACCESS_TOKEN="$new_token"
+                echo "CISCO_ACCESS_TOKEN=$new_token" >> "$GITHUB_ENV"
+                echo "✅ Token refreshed successfully"
+              else
+                echo "❌ Failed to refresh token"
+                return 1
+              fi
+            fi
+          }
+
           for batch in diff_batch_*; do
             [ -f "$batch" ] || continue
             
+            echo "📝 Processing batch: $(basename "$batch")"
+            
+            # Refresh token if needed before each batch
+            refresh_token_if_needed || continue
+            
             diff_content=$(cat "$batch")
+            
+            # Create request payload following Cisco API documentation format
             request=$(jq -n \
               --arg model "gpt-4o-mini" \
               --arg system "You summarize git diffs for PR descriptions. Focus on what changed and why it matters." \
               --arg user "$diff_content" \
               --arg appkey "$CISCO_APP_KEY" \
-              '{model:$model, messages:[{role:"system",content:$system},{role:"user",content:$user}], max_tokens:300, temperature:0.2, user:("{\"appkey\": \"" + $appkey + "\"}")}')
+              '{
+                "messages": [
+                  {"role": "system", "content": $system},
+                  {"role": "user", "content": $user}
+                ],
+                "max_tokens": 300,
+                "temperature": 0.2,
+                "user": ("{\"appkey\": \"" + $appkey + "\"}")
+              }')
             
+            echo "🚀 Making API call to Cisco AI..."
             response=$(curl -s --retry 2 --retry-delay 2 \
               "https://chat-ai.cisco.com/openai/deployments/gpt-4o-mini/chat/completions" \
               -H "Content-Type: application/json" \
@@ -213,10 +224,16 @@ jobs:
             if echo "$response" | jq -e .choices >/dev/null 2>&1; then
               summary=$(echo "$response" | jq -r '.choices[0].message.content // ""')
               if [ -n "$summary" ]; then
+                echo "✅ Successfully generated summary for $(basename "$batch")"
                 echo "## Batch $(basename "$batch")" >> batch_summaries.txt
                 echo "$summary" >> batch_summaries.txt
                 echo "" >> batch_summaries.txt
+              else
+                echo "⚠️  Empty response for batch $(basename "$batch")"
               fi
+            else
+              echo "❌ Failed to process batch $(basename "$batch")"
+              echo "Response: $response"
             fi
           done
 
@@ -227,13 +244,23 @@ jobs:
 
           system_prompt="You are a professional release engineer and technical writer. Given a collection of git-diff summaries, produce a concise, structured PR description. Output must include: 1) Short summary (1-2 lines), 2) Bullet list of changed areas/files, 3) Impact/risk (Low/Medium/High) with justification, 4) Testing notes and validation commands, 5) Suggested reviewers/teams. Keep it production-ready and concise."
 
+          # Create request payload following Cisco API documentation format
           request=$(jq -n \
             --arg model "gpt-4o-mini" \
             --arg system "$system_prompt" \
             --arg user "$full_summary" \
             --arg appkey "$CISCO_APP_KEY" \
-            '{model:$model, messages:[{role:"system",content:$system},{role:"user",content:$user}], max_tokens:400, temperature:0.2, user:("{\"appkey\": \"" + $appkey + "\"}")}')
+            '{
+              "messages": [
+                {"role": "system", "content": $system},
+                {"role": "user", "content": $user}
+              ],
+              "max_tokens": 400,
+              "temperature": 0.2,
+              "user": ("{\"appkey\": \"" + $appkey + "\"}")
+            }')
 
+          echo "🚀 Generating final PR description with Cisco AI..."
           response=$(curl -s --retry 2 --retry-delay 2 \
             "https://chat-ai.cisco.com/openai/deployments/gpt-4o-mini/chat/completions" \
             -H "Content-Type: application/json" \
@@ -243,8 +270,11 @@ jobs:
 
           if echo "$response" | jq -e .choices >/dev/null 2>&1; then
             pr_desc=$(echo "$response" | jq -r '.choices[0].message.content // ""')
+            echo "✅ Successfully generated PR description"
           else
-            pr_desc="Failed to generate PR description."
+            echo "❌ Failed to generate PR description, using fallback"
+            echo "Response: $response"
+            pr_desc="Failed to generate PR description using Cisco AI."
           fi
 
           echo 'PR_DESCRIPTION<<EOF' >> "$GITHUB_ENV"
@@ -258,13 +288,23 @@ jobs:
 
           tests_prompt="You are a test architect. From the provided git diff, produce prioritized test cases and steps to validate the changes, including boundary and negative cases. Focus on practical testing approaches."
 
+          # Create request payload following Cisco API documentation format
           request=$(jq -n \
             --arg model "gpt-4o-mini" \
             --arg system "$tests_prompt" \
             --arg user "$diff_all" \
             --arg appkey "$CISCO_APP_KEY" \
-            '{model:$model, messages:[{role:"system",content:$system},{role:"user",content:$user}], max_tokens:500, temperature:0.2, user:("{\"appkey\": \"" + $appkey + "\"}")}')
+            '{
+              "messages": [
+                {"role": "system", "content": $system},
+                {"role": "user", "content": $user}
+              ],
+              "max_tokens": 500,
+              "temperature": 0.2,
+              "user": ("{\"appkey\": \"" + $appkey + "\"}")
+            }')
 
+          echo "🚀 Generating test scenarios with Cisco AI..."
           response=$(curl -s --retry 2 --retry-delay 2 \
             "https://chat-ai.cisco.com/openai/deployments/gpt-4o-mini/chat/completions" \
             -H "Content-Type: application/json" \
@@ -272,7 +312,14 @@ jobs:
             -H "api-key: ${CISCO_ACCESS_TOKEN}" \
             -d "$request")
 
-          test_text=$(echo "$response" | jq -r '.choices[0].message.content // ""')
+          if echo "$response" | jq -e .choices >/dev/null 2>&1; then
+            test_text=$(echo "$response" | jq -r '.choices[0].message.content // ""')
+            echo "✅ Successfully generated test scenarios"
+          else
+            echo "❌ Failed to generate test scenarios, using fallback"
+            echo "Response: $response"
+            test_text="Failed to generate test scenarios using Cisco AI."
+          fi
 
           echo 'AI_TEST_SCENARIOS<<EOF' >> "$GITHUB_ENV"
           echo "$test_text" >> "$GITHUB_ENV"
@@ -434,6 +481,7 @@ jobs:
         if: steps.change_detection.outputs.has_changes == 'true'
         run: |
           echo "🎉 AI PR Description Workflow Complete!"
-          echo "✅ PR Description: Updated"
-          echo "✅ Test Scenarios: Posted as comment"
+          echo "✅ PR Description: Updated using Cisco AI"
+          echo "✅ Test Scenarios: Posted as comment using Cisco AI"
           echo "✅ Jira Integration: Attempted"
+          echo "🤖 AI Provider: Cisco Chat AI (gpt-4o-mini model)"
