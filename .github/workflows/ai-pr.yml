@@ -206,33 +206,23 @@ jobs:
 
           echo "✅ Jira API access successful"
 
-          # Prepare comment content with proper environment variable substitution
-          cat > /tmp/jira_comment.txt << 'JIRAEOF'
+          # Prepare comment content using environment variables directly
+          cat > /tmp/jira_comment.txt << EOF
           ## GitHub PR Information
-          - **Repository:** GITHUB_REPO_PLACEHOLDER
-          - **PR Number:** #GITHUB_PR_NUMBER_PLACEHOLDER
-          - **Title:** GITHUB_PR_TITLE_PLACEHOLDER
-          - **Link:** GITHUB_PR_URL_PLACEHOLDER
+          - **Repository:** ${{ github.repository }}
+          - **PR Number:** #${{ github.event.pull_request.number }}
+          - **Title:** ${PR_TITLE}
+          - **Link:** ${{ github.event.pull_request.html_url }}
 
           ## AI Generated PR Description
-          PR_DESCRIPTION_PLACEHOLDER
+          ${PR_DESCRIPTION}
 
           ## Test Scenarios
-          AI_TEST_SCENARIOS_PLACEHOLDER
+          ${AI_TEST_SCENARIOS}
 
           ---
           *Comment automatically posted by GitHub Actions*
-          JIRAEOF
-
-          # Replace placeholders with actual values
-          sed -i "s/GITHUB_REPO_PLACEHOLDER/${{ github.repository }}/g" /tmp/jira_comment.txt
-          sed -i "s/GITHUB_PR_NUMBER_PLACEHOLDER/${{ github.event.pull_request.number }}/g" /tmp/jira_comment.txt
-          sed -i "s/GITHUB_PR_TITLE_PLACEHOLDER/${{ github.event.pull_request.title }}/g" /tmp/jira_comment.txt
-          sed -i "s|GITHUB_PR_URL_PLACEHOLDER|${{ github.event.pull_request.html_url }}|g" /tmp/jira_comment.txt
-
-          # Replace environment variables using perl for safer substitution
-          perl -i -pe "s/PR_DESCRIPTION_PLACEHOLDER/\Q$ENV{PR_DESCRIPTION}\E/g" /tmp/jira_comment.txt
-          perl -i -pe "s/AI_TEST_SCENARIOS_PLACEHOLDER/\Q$ENV{AI_TEST_SCENARIOS}\E/g" /tmp/jira_comment.txt
+          EOF
 
           # Create Jira comment
           COMMENT_JSON=$(cat /tmp/jira_comment.txt | jq -Rs '{body: .}')
