@@ -206,26 +206,17 @@ jobs:
 
           echo "✅ Jira API access successful"
 
-          # Prepare comment content using environment variables directly
-          cat > /tmp/jira_comment.txt << EOF
-          ## GitHub PR Information
-          - **Repository:** ${{ github.repository }}
-          - **PR Number:** #${{ github.event.pull_request.number }}
-          - **Title:** ${PR_TITLE}
-          - **Link:** ${{ github.event.pull_request.html_url }}
-
-          ## AI Generated PR Description
-          ${PR_DESCRIPTION}
-
-          ## Test Scenarios
-          ${AI_TEST_SCENARIOS}
-
-          ---
-          *Comment automatically posted by GitHub Actions*
-          EOF
-
-          # Create Jira comment
-          COMMENT_JSON=$(cat /tmp/jira_comment.txt | jq -Rs '{body: .}')
+          # Create Jira comment using jq to properly escape all content
+          COMMENT_JSON=$(jq -n \
+            --arg repo "${{ github.repository }}" \
+            --arg pr_num "${{ github.event.pull_request.number }}" \
+            --arg pr_title "$PR_TITLE" \
+            --arg pr_url "${{ github.event.pull_request.html_url }}" \
+            --arg pr_desc "$PR_DESCRIPTION" \
+            --arg test_scenarios "$AI_TEST_SCENARIOS" \
+            '{
+              body: "## GitHub PR Information\n- **Repository:** \($repo)\n- **PR Number:** #\($pr_num)\n- **Title:** \($pr_title)\n- **Link:** \($pr_url)\n\n## AI Generated PR Description\n\($pr_desc)\n\n## Test Scenarios\n\($test_scenarios)\n\n---\n*Comment automatically posted by GitHub Actions*"
+            }')
 
           response=$(curl -s -w "%{http_code}" -X POST \
             -u "$JIRA_EMAIL:$JIRA_TOKEN" \
@@ -240,6 +231,8 @@ jobs:
           else
             echo "❌ Failed to post to Jira. HTTP code: $http_code"
             echo "$response"
+            echo "Debug: Comment JSON was:"
+            echo "$COMMENT_JSON"
           fi
 
       - name: Cleanup temporary files
