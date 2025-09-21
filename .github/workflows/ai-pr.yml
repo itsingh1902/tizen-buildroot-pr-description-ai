@@ -230,14 +230,9 @@ jobs:
           sed -i "s/GITHUB_PR_TITLE_PLACEHOLDER/${{ github.event.pull_request.title }}/g" /tmp/jira_comment.txt
           sed -i "s|GITHUB_PR_URL_PLACEHOLDER|${{ github.event.pull_request.html_url }}|g" /tmp/jira_comment.txt
 
-          # Replace environment variables using a temporary script
-          cat > /tmp/replace_vars.sh << 'SCRIPTEOF'
-          #!/bin/bash
-          sed -i "s/PR_DESCRIPTION_PLACEHOLDER/${PR_DESCRIPTION//\//\\/}/g" /tmp/jira_comment.txt
-          sed -i "s/AI_TEST_SCENARIOS_PLACEHOLDER/${AI_TEST_SCENARIOS//\//\\/}/g" /tmp/jira_comment.txt
-          SCRIPTEOF
-          chmod +x /tmp/replace_vars.sh
-          /tmp/replace_vars.sh
+          # Replace environment variables using perl for safer substitution
+          perl -i -pe "s/PR_DESCRIPTION_PLACEHOLDER/\Q$ENV{PR_DESCRIPTION}\E/g" /tmp/jira_comment.txt
+          perl -i -pe "s/AI_TEST_SCENARIOS_PLACEHOLDER/\Q$ENV{AI_TEST_SCENARIOS}\E/g" /tmp/jira_comment.txt
 
           # Create Jira comment
           COMMENT_JSON=$(cat /tmp/jira_comment.txt | jq -Rs '{body: .}')
