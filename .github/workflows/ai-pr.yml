@@ -206,39 +206,33 @@ jobs:
 
           echo "✅ Jira API access successful"
 
-          # Create Jira comment using jq to properly escape all content
-          COMMENT_JSON=$(jq -n \
-            --arg repo "${{ github.repository }}" \
-            --arg pr_num "${{ github.event.pull_request.number }}" \
-            --arg pr_title "$PR_TITLE" \
-            --arg pr_url "${{ github.event.pull_request.html_url }}" \
-            --arg pr_desc "$PR_DESCRIPTION" \
-            --arg test_scenarios "$AI_TEST_SCENARIOS" \
-            '{
-              body: "## GitHub PR Information\n- **Repository:** \($repo)\n- **PR Number:** #\($pr_num)\n- **Title:** \($pr_title)\n- **Link:** \($pr_url)\n\n## AI Generated PR Description\n\($pr_desc)\n\n## Test Scenarios\n\($test_scenarios)\n\n---\n*Comment automatically posted by GitHub Actions*"
-            }')
+          # Create a clean, simple comment for Jira
+          cat > /tmp/jira_comment.json << EOF
+          {
+            "body": "GitHub PR Update:\n\nRepository: ${{ github.repository }}\nPR: #${{ github.event.pull_request.number }}\nTitle: ${PR_TITLE}\nLink: ${{ github.event.pull_request.html_url }}\n\nAI-generated PR description and test scenarios have been added to the GitHub PR.\n\n---\nPosted by GitHub Actions"
+          }
+          EOF
 
           response=$(curl -s -w "%{http_code}" -X POST \
             -u "$JIRA_EMAIL:$JIRA_TOKEN" \
             -H "Content-Type: application/json" \
             "$JIRA_BASE_URL/rest/api/3/issue/$KEY/comment" \
-            -d "$COMMENT_JSON")
+            -d @/tmp/jira_comment.json)
 
           http_code="${response: -3}"
+          response_body="${response%???}"
 
           if [ "$http_code" = "201" ]; then
-            echo "✅ Successfully posted AI content to Jira issue $KEY"
+            echo "✅ Successfully posted notification to Jira issue $KEY"
           else
             echo "❌ Failed to post to Jira. HTTP code: $http_code"
-            echo "$response"
-            echo "Debug: Comment JSON was:"
-            echo "$COMMENT_JSON"
+            echo "Response: $response_body"
           fi
 
       - name: Cleanup temporary files
         if: always()
         run: |
-          rm -f diff.txt diff_batch_* batch_summaries.txt /tmp/jira_comment.txt /tmp/replace_vars.sh || true
+          rm -f diff.txt diff_batch_* batch_summaries.txt /tmp/jira_comment.json || true
 
       - name: Workflow summary
         if: steps.change_detection.outputs.has_changes == 'true'
