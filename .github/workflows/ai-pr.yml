@@ -179,8 +179,15 @@ jobs:
           JIRA_TOKEN: ${{ secrets.JIRA_PERSONAL_TOKEN }}
           JIRA_EMAIL: itsingh@cisco.com
         run: |
+          set -e  # Exit on any error
+
           PR_TITLE="${{ github.event.pull_request.title }}"
           BRANCH="${{ github.head_ref }}"
+
+          # Escape special characters for JSON
+          escape_json() {
+            echo "$1" | sed 's/\\/\\\\/g; s/"/\\"/g; s/\t/\\t/g; s/\r/\\r/g; s/\n/\\n/g'
+          }
 
           # Extract Jira issue key from PR title or branch name
           KEY=$(echo -e "${PR_TITLE}\n${BRANCH}" | grep -oE '[A-Z]{2,10}-[0-9]+' | head -1 || true)
@@ -195,6 +202,7 @@ jobs:
           # Verify access to Jira issue
           test_response=$(curl -s -w "%{http_code}" -X GET \
             -u "$JIRA_EMAIL:$JIRA_TOKEN" \
+            -H "Accept: application/json" \
             -H "Content-Type: application/json" \
             "$JIRA_BASE_URL/rest/api/3/issue/$KEY")
           test_code="${test_response: -3}"
@@ -206,33 +214,93 @@ jobs:
 
           echo "✅ Jira API access successful"
 
-          # Create a clean, simple comment for Jira
-          cat > /tmp/jira_comment.json << EOF
-          {
-            "body": "GitHub PR Update:\n\nRepository: ${{ github.repository }}\nPR: #${{ github.event.pull_request.number }}\nTitle: ${PR_TITLE}\nLink: ${{ github.event.pull_request.html_url }}\n\nAI-generated PR description and test scenarios have been added to the GitHub PR.\n\n---\nPosted by GitHub Actions"
-          }
-          EOF
+          # Escape data for JSON
+          ESCAPED_REPO=$(escape_json "${{ github.repository }}")
+          ESCAPED_TITLE=$(escape_json "${PR_TITLE}")
+          ESCAPED_URL=$(escape_json "${{ github.event.pull_request.html_url }}")
 
+          # Escape PR description for JSON
+          ESCAPED_PR_DESCRIPTION=$(escape_json "$PR_DESCRIPTION")
+
+          # Create Jira comment using Atlassian Document Format (ADF)
+          # This is the correct format for Jira Cloud API v3
+          jq -n \
+            --arg pr_description "$ESCAPED_PR_DESCRIPTION" \
+            '{
+              "body": {
+                "type": "doc",
+                "version": 1,
+                "content": [
+                  {
+                    "type": "paragraph",
+                    "content": [
+                      {
+                        "type": "text",
+                        "text": $pr_description
+                      }
+                    ]
+                  }
+                ]
+              }
+            }' > /tmp/jira_comment.json
+
+          # Debug: Show the JSON payload (without sensitive data)
+          echo "📝 Jira comment payload prepared"
+
+          # Post comment to Jira
           response=$(curl -s -w "%{http_code}" -X POST \
             -u "$JIRA_EMAIL:$JIRA_TOKEN" \
+            -H "Accept: application/json" \
             -H "Content-Type: application/json" \
             "$JIRA_BASE_URL/rest/api/3/issue/$KEY/comment" \
-            -d @/tmp/jira_comment.json)
+            -d @/tmp/jira_comment.json 2>/dev/null || echo "000")
 
           http_code="${response: -3}"
           response_body="${response%???}"
 
           if [ "$http_code" = "201" ]; then
             echo "✅ Successfully posted notification to Jira issue $KEY"
+          elif [ "$http_code" = "400" ] && echo "$response_body" | grep -q "Comment body is not valid"; then
+            echo "⚠️  ADF format failed, trying simple text format..."
+            
+            # Fallback to simple text format using API v2
+            jq -n \
+              --arg pr_description "$ESCAPED_PR_DESCRIPTION" \
+              '{
+                "body": $pr_description
+              }' > /tmp/jira_comment_simple.json
+
+            fallback_response=$(curl -s -w "%{http_code}" -X POST \
+              -u "$JIRA_EMAIL:$JIRA_TOKEN" \
+              -H "Accept: application/json" \
+              -H "Content-Type: application/json" \
+              "$JIRA_BASE_URL/rest/api/2/issue/$KEY/comment" \
+              -d @/tmp/jira_comment_simple.json 2>/dev/null || echo "000")
+
+            fallback_code="${fallback_response: -3}"
+            
+            if [ "$fallback_code" = "201" ]; then
+              echo "✅ Successfully posted notification to Jira issue $KEY (using fallback format)"
+            else
+              echo "❌ Both ADF and simple formats failed. HTTP code: $fallback_code"
+              if [ -n "${fallback_response%???}" ]; then
+                echo "Fallback response: ${fallback_response%???}"
+              fi
+              echo "⚠️  Continuing workflow despite Jira posting failure"
+            fi
           else
             echo "❌ Failed to post to Jira. HTTP code: $http_code"
-            echo "Response: $response_body"
+            if [ -n "$response_body" ] && [ "$response_body" != "000" ]; then
+              echo "Response: $response_body"
+            fi
+            # Don't fail the entire workflow for Jira issues
+            echo "⚠️  Continuing workflow despite Jira posting failure"
           fi
 
       - name: Cleanup temporary files
         if: always()
         run: |
-          rm -f diff.txt diff_batch_* batch_summaries.txt /tmp/jira_comment.json || true
+          rm -f diff.txt diff_batch_* batch_summaries.txt /tmp/jira_comment.json /tmp/jira_comment_simple.json || true
 
       - name: Workflow summary
         if: steps.change_detection.outputs.has_changes == 'true'
