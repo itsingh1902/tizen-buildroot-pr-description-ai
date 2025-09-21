@@ -56,51 +56,34 @@ jobs:
             exit 1
           fi
 
-      - name: Generate Cisco access token
+      - name: Obtain Cisco access token
+        id: cisco_token
         run: |
           echo "🔍 Debugging Cisco token generation..."
           echo "CISCO_CLIENT_ID length: ${#CISCO_CLIENT_ID}"
           echo "CISCO_CLIENT_SECRET length: ${#CISCO_CLIENT_SECRET}"
           echo "CISCO_APP_KEY length: ${#CISCO_APP_KEY}"
 
-          echo "🚀 Starting Cisco API authentication..."
-          echo "🔧 Generating Cisco access token..."
-
-          # Use the exact same approach that works manually
-          encoded_credentials=$(echo -n "${CISCO_CLIENT_ID}:${CISCO_CLIENT_SECRET}" | base64)
-          echo "🔧 Encoded credentials prepared (length: ${#encoded_credentials})"
+          encoded_value=$(echo -n "${CISCO_CLIENT_ID}:${CISCO_CLIENT_SECRET}" | base64)
+          echo "🔧 Encoded credentials prepared (length: ${#encoded_value})"
 
           echo "📤 Making OAuth request to Cisco..."
-          response=$(curl -s -X POST \
-            https://id.cisco.com/oauth2/default/v1/token \
-            -H 'Accept: */*' \
-            -H 'Content-Type: application/x-www-form-urlencoded' \
-            -H "Authorization: Basic ${encoded_credentials}" \
-            -d 'grant_type=client_credentials')
+          response=$(curl -v --location --request POST 'https://id.cisco.com/oauth2/default/v1/token' \
+            --header 'Accept: */*' \
+            --header 'Content-Type: application/x-www-form-urlencoded' \
+            --header "Authorization: Basic $encoded_value" \
+            --data-urlencode 'grant_type=client_credentials' 2>&1)
 
-          echo "📥 Response received (length: ${#response})"
-          echo "📋 Response content: $response"
+          echo "OAuth raw response: $response"
 
-          # Extract access token
-          if echo "$response" | jq . >/dev/null 2>&1; then
-            access_token=$(echo "$response" | jq -r '.access_token // empty')
-            
-            if [ -n "$access_token" ] && [ "$access_token" != "null" ] && [ "$access_token" != "empty" ]; then
-              echo "✅ Access token obtained successfully (length: ${#access_token})"
-              echo "CISCO_ACCESS_TOKEN=$access_token" >> "$GITHUB_ENV"
-            else
-              echo "❌ Failed to obtain access token from response"
-              if echo "$response" | jq -e '.error' >/dev/null 2>&1; then
-                echo "OAuth error: $(echo "$response" | jq -r '.error // "unknown"')"
-                echo "OAuth error description: $(echo "$response" | jq -r '.error_description // "no description"')"
-              fi
-              exit 1
-            fi
-          else
-            echo "❌ Invalid JSON response from OAuth endpoint"
-            echo "Response: $response"
+          token=$(echo "$response" | jq -r .access_token)
+          if [ -z "$token" ] || [ "$token" = "null" ]; then
+            echo "❌ Failed to obtain Cisco access token"
+            echo "Response was: $response"
             exit 1
           fi
+          echo "✅ Cisco access token obtained"
+          echo "CISCO_ACCESS_TOKEN=$token" >> "$GITHUB_ENV"
 
       - name: Extract git diff
         run: |
@@ -128,47 +111,26 @@ jobs:
 
           for batch in diff_batch_*; do
             [ -f "$batch" ] || continue
-            
-            echo "📝 Processing batch: $(basename "$batch")"
             diff_content=$(cat "$batch")
-            
-            # Create request payload following Cisco API documentation format
             request=$(jq -n \
               --arg model "gpt-4o-mini" \
               --arg system "You summarize git diffs for PR descriptions. Focus on what changed and why it matters." \
               --arg user "$diff_content" \
               --arg appkey "$CISCO_APP_KEY" \
-              '{
-                "messages": [
-                  {"role": "system", "content": $system},
-                  {"role": "user", "content": $user}
-                ],
-                "max_tokens": 300,
-                "temperature": 0.2,
-                "user": ("{\"appkey\": \"" + $appkey + "\"}")
-              }')
-            
-            echo "🚀 Making API call to Cisco AI..."
+              '{model:$model, messages:[{role:"system",content:$system},{role:"user",content:$user}], max_tokens:300, temperature:0.2, user:("{\"appkey\": \"" + $appkey + "\"}")}')
             response=$(curl -s --retry 2 --retry-delay 2 \
               "https://chat-ai.cisco.com/openai/deployments/gpt-4o-mini/chat/completions" \
               -H "Content-Type: application/json" \
               -H "Accept: application/json" \
               -H "api-key: ${CISCO_ACCESS_TOKEN}" \
               -d "$request")
-            
             if echo "$response" | jq -e .choices >/dev/null 2>&1; then
               summary=$(echo "$response" | jq -r '.choices[0].message.content // ""')
               if [ -n "$summary" ]; then
-                echo "✅ Successfully generated summary for $(basename "$batch")"
                 echo "## Batch $(basename "$batch")" >> batch_summaries.txt
                 echo "$summary" >> batch_summaries.txt
                 echo "" >> batch_summaries.txt
-              else
-                echo "⚠️  Empty response for batch $(basename "$batch")"
               fi
-            else
-              echo "❌ Failed to process batch $(basename "$batch")"
-              echo "Response: $response"
             fi
           done
 
@@ -179,23 +141,13 @@ jobs:
 
           system_prompt="You are a professional release engineer and technical writer. Given a collection of git-diff summaries, produce a concise, structured PR description. Output must include: 1) Short summary (1-2 lines), 2) Bullet list of changed areas/files, 3) Impact/risk (Low/Medium/High) with justification, 4) Testing notes and validation commands, 5) Suggested reviewers/teams. Keep it production-ready and concise."
 
-          # Create request payload following Cisco API documentation format
           request=$(jq -n \
             --arg model "gpt-4o-mini" \
             --arg system "$system_prompt" \
             --arg user "$full_summary" \
             --arg appkey "$CISCO_APP_KEY" \
-            '{
-              "messages": [
-                {"role": "system", "content": $system},
-                {"role": "user", "content": $user}
-              ],
-              "max_tokens": 400,
-              "temperature": 0.2,
-              "user": ("{\"appkey\": \"" + $appkey + "\"}")
-            }')
+            '{model:$model, messages:[{role:"system",content:$system},{role:"user",content:$user}], max_tokens:400, temperature:0.2, user:("{\"appkey\": \"" + $appkey + "\"}")}')
 
-          echo "🚀 Generating final PR description with Cisco AI..."
           response=$(curl -s --retry 2 --retry-delay 2 \
             "https://chat-ai.cisco.com/openai/deployments/gpt-4o-mini/chat/completions" \
             -H "Content-Type: application/json" \
@@ -205,11 +157,8 @@ jobs:
 
           if echo "$response" | jq -e .choices >/dev/null 2>&1; then
             pr_desc=$(echo "$response" | jq -r '.choices[0].message.content // ""')
-            echo "✅ Successfully generated PR description"
           else
-            echo "❌ Failed to generate PR description, using fallback"
-            echo "Response: $response"
-            pr_desc="Failed to generate PR description using Cisco AI."
+            pr_desc="Failed to generate PR description."
           fi
 
           echo 'PR_DESCRIPTION<<EOF' >> "$GITHUB_ENV"
@@ -223,23 +172,13 @@ jobs:
 
           tests_prompt="You are a test architect. From the provided git diff, produce prioritized test cases and steps to validate the changes, including boundary and negative cases. Focus on practical testing approaches."
 
-          # Create request payload following Cisco API documentation format
           request=$(jq -n \
             --arg model "gpt-4o-mini" \
             --arg system "$tests_prompt" \
             --arg user "$diff_all" \
             --arg appkey "$CISCO_APP_KEY" \
-            '{
-              "messages": [
-                {"role": "system", "content": $system},
-                {"role": "user", "content": $user}
-              ],
-              "max_tokens": 500,
-              "temperature": 0.2,
-              "user": ("{\"appkey\": \"" + $appkey + "\"}")
-            }')
+            '{model:$model, messages:[{role:"system",content:$system},{role:"user",content:$user}], max_tokens:500, temperature:0.2, user:("{\"appkey\": \"" + $appkey + "\"}")}')
 
-          echo "🚀 Generating test scenarios with Cisco AI..."
           response=$(curl -s --retry 2 --retry-delay 2 \
             "https://chat-ai.cisco.com/openai/deployments/gpt-4o-mini/chat/completions" \
             -H "Content-Type: application/json" \
@@ -247,14 +186,7 @@ jobs:
             -H "api-key: ${CISCO_ACCESS_TOKEN}" \
             -d "$request")
 
-          if echo "$response" | jq -e .choices >/dev/null 2>&1; then
-            test_text=$(echo "$response" | jq -r '.choices[0].message.content // ""')
-            echo "✅ Successfully generated test scenarios"
-          else
-            echo "❌ Failed to generate test scenarios, using fallback"
-            echo "Response: $response"
-            test_text="Failed to generate test scenarios using Cisco AI."
-          fi
+          test_text=$(echo "$response" | jq -r '.choices[0].message.content // ""')
 
           echo 'AI_TEST_SCENARIOS<<EOF' >> "$GITHUB_ENV"
           echo "$test_text" >> "$GITHUB_ENV"
@@ -282,15 +214,128 @@ jobs:
               -F body="$COMMENT_BODY"
           fi
 
+      - name: Add PR description to Jira ticket
+        if: steps.change_detection.outputs.has_changes == 'true'
+        env:
+          JIRA_BASE_URL: https://cisco-sbg.atlassian.net
+          JIRA_TOKEN: ${{ secrets.JIRA_PERSONAL_TOKEN }}
+          JIRA_EMAIL: itsingh@cisco.com
+        run: |
+          set -e  # Exit on any error
+
+          PR_TITLE="${{ github.event.pull_request.title }}"
+          BRANCH="${{ github.head_ref }}"
+
+          escape_json() {
+            echo "$1" | sed 's/\\/\\\\/g; s/"/\\"/g; s/\t/\\t/g; s/\r/\\r/g; s/\n/\\n/g'
+          }
+
+          KEY=$(echo -e "${PR_TITLE}\n${BRANCH}" | grep -oE '[A-Z]{2,10}-[0-9]+' | head -1 || true)
+
+          if [ -z "$KEY" ]; then
+            echo "No Jira issue key found; skipping Jira update."
+            exit 0
+          fi
+
+          echo "Found Jira key: $KEY"
+
+          test_response=$(curl -s -w "%{http_code}" -X GET \
+            -u "$JIRA_EMAIL:$JIRA_TOKEN" \
+            -H "Accept: application/json" \
+            -H "Content-Type: application/json" \
+            "$JIRA_BASE_URL/rest/api/3/issue/$KEY")
+          test_code="${test_response: -3}"
+
+          if [ "$test_code" != "200" ]; then
+            echo "❌ Cannot access Jira issue $KEY. HTTP code: $test_code"
+            exit 1
+          fi
+
+          echo "✅ Jira API access successful"
+
+          ESCAPED_REPO=$(escape_json "${{ github.repository }}")
+          ESCAPED_TITLE=$(escape_json "${PR_TITLE}")
+          ESCAPED_URL=$(escape_json "${{ github.event.pull_request.html_url }}")
+          ESCAPED_PR_DESCRIPTION=$(escape_json "$PR_DESCRIPTION")
+
+          jq -n \
+            --arg pr_description "$ESCAPED_PR_DESCRIPTION" \
+            '{
+              "body": {
+                "type": "doc",
+                "version": 1,
+                "content": [
+                  {
+                    "type": "paragraph",
+                    "content": [
+                      {
+                        "type": "text",
+                        "text": $pr_description
+                      }
+                    ]
+                  }
+                ]
+              }
+            }' > /tmp/jira_comment.json
+
+          echo "📝 Jira comment payload prepared"
+
+          response=$(curl -s -w "%{http_code}" -X POST \
+            -u "$JIRA_EMAIL:$JIRA_TOKEN" \
+            -H "Accept: application/json" \
+            -H "Content-Type: application/json" \
+            "$JIRA_BASE_URL/rest/api/3/issue/$KEY/comment" \
+            -d @/tmp/jira_comment.json 2>/dev/null || echo "000")
+
+          http_code="${response: -3}"
+          response_body="${response%???}"
+
+          if [ "$http_code" = "201" ]; then
+            echo "✅ Successfully posted notification to Jira issue $KEY"
+          elif [ "$http_code" = "400" ] && echo "$response_body" | grep -q "Comment body is not valid"; then
+            echo "⚠️  ADF format failed, trying simple text format..."
+
+            jq -n \
+              --arg pr_description "$ESCAPED_PR_DESCRIPTION" \
+              '{
+                "body": $pr_description
+              }' > /tmp/jira_comment_simple.json
+
+            fallback_response=$(curl -s -w "%{http_code}" -X POST \
+              -u "$JIRA_EMAIL:$JIRA_TOKEN" \
+              -H "Accept: application/json" \
+              -H "Content-Type: application/json" \
+              "$JIRA_BASE_URL/rest/api/2/issue/$KEY/comment" \
+              -d @/tmp/jira_comment_simple.json 2>/dev/null || echo "000")
+
+            fallback_code="${fallback_response: -3}"
+
+            if [ "$fallback_code" = "201" ]; then
+              echo "✅ Successfully posted notification to Jira issue $KEY (using fallback format)"
+            else
+              echo "❌ Both ADF and simple formats failed. HTTP code: $fallback_code"
+              if [ -n "${fallback_response%???}" ]; then
+                echo "Fallback response: ${fallback_response%???}"
+              fi
+              echo "⚠️  Continuing workflow despite Jira posting failure"
+            fi
+          else
+            echo "❌ Failed to post to Jira. HTTP code: $http_code"
+            if [ -n "$response_body" ] && [ "$response_body" != "000" ]; then
+              echo "Response: $response_body"
+            fi
+            echo "⚠️  Continuing workflow despite Jira posting failure"
+          fi
+
       - name: Cleanup temporary files
         if: always()
         run: |
-          rm -f diff.txt diff_batch_* batch_summaries.txt || true
+          rm -f diff.txt diff_batch_* batch_summaries.txt /tmp/jira_comment.json /tmp/jira_comment_simple.json || true
 
       - name: Workflow summary
         if: steps.change_detection.outputs.has_changes == 'true'
         run: |
           echo "🎉 AI PR Description Workflow Complete!"
-          echo "✅ PR Description: Updated using Cisco AI"
-          echo "✅ Test Scenarios: Posted as comment using Cisco AI"
-          echo "🤖 AI Provider: Cisco Chat AI (gpt-4o-mini model)"
+          echo "✅ PR Description: Updated"
+          echo "✅ Test Scenarios: Posted as comment"
+          echo "✅ Jira Integration: Attempted"
