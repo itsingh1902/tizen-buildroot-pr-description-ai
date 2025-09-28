@@ -1,0 +1,242 @@
+name: AI PR Description Generator
+
+on:
+  pull_request:
+    types: [opened, synchronize]
+
+concurrency:
+  group: ai-pr-description-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+  pull-requests: write
+  issues: write
+
+jobs:
+  generate_pr_description:
+    runs-on: ubuntu-latest
+    env:
+      CISCO_CLIENT_ID: ${{ secrets.CISCO_CLIENT_ID }}
+      CISCO_CLIENT_SECRET: ${{ secrets.CISCO_CLIENT_SECRET }}
+      CISCO_APP_KEY: ${{ secrets.CISCO_APP_KEY }}
+      GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      BATCH_SIZE: 150
+
+    steps:
+      - name: Setup
+        run: |
+          sudo apt-get update && sudo apt-get install -y jq curl git gh
+          # Validate required secrets
+          for var in CISCO_CLIENT_ID CISCO_CLIENT_SECRET CISCO_APP_KEY GITHUB_TOKEN; do
+            if [ -z "${!var:-}" ]; then
+              echo "❌ $var is not set" && exit 1
+            fi
+          done
+
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          ref: ${{ github.head_ref }}
+
+      - name: Get Cisco API token
+        run: |
+          credentials=$(echo -n "${CISCO_CLIENT_ID}:${CISCO_CLIENT_SECRET}" | base64 -w 0)
+          token_response=$(curl -s --retry 3 --retry-delay 2 \
+            -X POST 'https://id.cisco.com/oauth2/default/v1/token' \
+            -H 'Content-Type: application/x-www-form-urlencoded' \
+            -H "Authorization: Basic ${credentials}" \
+            -d 'grant_type=client_credentials')
+
+          access_token=$(echo "$token_response" | jq -r '.access_token // empty')
+
+          if [ -z "$access_token" ] || [ "$access_token" = "null" ]; then
+            echo "❌ Failed to obtain access token: $token_response" && exit 1
+          fi
+
+          echo "✅ Cisco API token obtained"
+          echo "CISCO_ACCESS_TOKEN=$access_token" >> "$GITHUB_ENV"
+
+      - name: Check for changes
+        id: changes
+        run: |
+          git diff "${{ github.event.pull_request.base.sha }}"..."${{ github.event.pull_request.head.sha }}" > diff.txt
+          if [ -s diff.txt ]; then
+            echo "has_changes=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "has_changes=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Generate AI summaries
+        if: steps.changes.outputs.has_changes == 'true'
+        run: |
+          # Split diff into batches and generate summaries
+          split -l "${BATCH_SIZE}" diff.txt diff_batch_
+          rm -f batch_summaries.txt
+
+          # Function to call Cisco AI API
+          call_ai() {
+            local content="$1"
+            local system_prompt="$2"
+            
+            jq -n \
+              --arg user_data "{\"appkey\": \"${CISCO_APP_KEY}\"}" \
+              --arg system "$system_prompt" \
+              --arg user "$content" \
+              '{
+                messages: [
+                  {role: "system", content: $system},
+                  {role: "user", content: $user}
+                ],
+                user: $user_data,
+                stop: ["<|im_end|>"]
+              }' | \
+            curl -s --retry 2 --retry-delay 2 \
+              "https://chat-ai.cisco.com/openai/deployments/gpt-4o-mini/chat/completions" \
+              -H "Content-Type: application/json" \
+              -H "api-key: ${CISCO_ACCESS_TOKEN}" \
+              -d @-
+          }
+
+          # Process each batch
+          for batch in diff_batch_*; do
+            [ -f "$batch" ] || continue
+            
+            response=$(call_ai "$(cat "$batch")" "You summarize git diffs for PR descriptions. Focus on what changed and why it matters.")
+            
+            if summary=$(echo "$response" | jq -r '.choices[0].message.content // ""' 2>/dev/null) && [ -n "$summary" ]; then
+              echo "## Batch $(basename "$batch")" >> batch_summaries.txt
+              echo "$summary" >> batch_summaries.txt
+              echo "" >> batch_summaries.txt
+            else
+              echo "⚠️ Failed to get summary for batch $batch"
+            fi
+          done
+
+      - name: Generate PR description
+        if: steps.changes.outputs.has_changes == 'true'
+        run: |
+          full_summary=$(cat batch_summaries.txt 2>/dev/null || "")
+          system_prompt="You are a professional release engineer. Create a concise PR description with: 1) Short summary, 2) Changed files/areas, 3) Impact/risk level, 4) Testing notes. Keep it production-ready."
+
+          response=$(call_ai "$full_summary" "$system_prompt")
+          pr_desc=$(echo "$response" | jq -r '.choices[0].message.content // "Failed to generate PR description."')
+
+          echo 'PR_DESCRIPTION<<EOF' >> "$GITHUB_ENV"
+          echo "$pr_desc" >> "$GITHUB_ENV"
+          echo 'EOF' >> "$GITHUB_ENV"
+
+      - name: Generate test scenarios
+        if: steps.changes.outputs.has_changes == 'true'
+        run: |
+          diff_content=$(cat diff.txt)
+          tests_prompt="You are a test architect. Create prioritized test cases for these changes, including boundary and negative cases. Focus on practical testing approaches."
+
+          response=$(call_ai "$diff_content" "$tests_prompt")
+          test_text=$(echo "$response" | jq -r '.choices[0].message.content // "Failed to generate test scenarios."')
+
+          echo 'AI_TEST_SCENARIOS<<EOF' >> "$GITHUB_ENV"
+          echo "$test_text" >> "$GITHUB_ENV"
+          echo 'EOF' >> "$GITHUB_ENV"
+
+      - name: Update PR description
+        if: steps.changes.outputs.has_changes == 'true'
+        run: |
+          gh api repos/${{ github.repository }}/pulls/${{ github.event.pull_request.number }} \
+            -X PATCH -F body="$PR_DESCRIPTION"
+
+      - name: Update test scenarios comment
+        if: steps.changes.outputs.has_changes == 'true'
+        run: |
+          comment_body="### 🧪 AI Test Scenarios
+
+          $AI_TEST_SCENARIOS
+
+          *This comment was generated automatically by AI to help with testing validation.*"
+
+          existing_id=$(gh api repos/${{ github.repository }}/issues/${{ github.event.pull_request.number }}/comments \
+            --jq '.[] | select(.user.login=="github-actions[bot]" and (.body | startswith("### 🧪 AI Test Scenarios"))) | .id' || true)
+
+          if [ -n "$existing_id" ]; then
+            gh api repos/${{ github.repository }}/issues/comments/$existing_id -X PATCH -F body="$comment_body"
+          else
+            gh api repos/${{ github.repository }}/issues/${{ github.event.pull_request.number }}/comments -F body="$comment_body"
+          fi
+
+      - name: Update Jira ticket
+        if: steps.changes.outputs.has_changes == 'true'
+        env:
+          JIRA_BASE_URL: https://cisco-sbg.atlassian.net
+          JIRA_TOKEN: ${{ secrets.JIRA_PERSONAL_TOKEN }}
+          JIRA_EMAIL: itsingh@cisco.com
+        run: |
+          # Extract Jira key from PR title or branch
+          KEY=$(echo -e "${{ github.event.pull_request.title }}\n${{ github.head_ref }}" | grep -oE '[A-Z]{2,10}-[0-9]+' | head -1 || true)
+
+          if [ -z "$KEY" ]; then
+            echo "No Jira key found, skipping Jira update"
+            exit 0
+          fi
+
+          echo "Found Jira key: $KEY"
+
+          # Function to post Jira comment
+          post_jira_comment() {
+            local api_version="$1"
+            local payload="$2"
+            
+            curl -s -w "%{http_code}" -X POST \
+              -u "$JIRA_EMAIL:$JIRA_TOKEN" \
+              -H "Accept: application/json" \
+              -H "Content-Type: application/json" \
+              "$JIRA_BASE_URL/rest/api/$api_version/issue/$KEY/comment" \
+              -d "$payload" 2>/dev/null || echo "000"
+          }
+
+          # Escape PR description for JSON
+          escaped_desc=$(echo "$PR_DESCRIPTION" | sed 's/\\/\\\\/g; s/"/\\"/g; s/\r/\\r/g; s/\n/\\n/g')
+
+          # Try ADF format first (API v3)
+          adf_payload=$(jq -n --arg desc "$escaped_desc" '{
+            "body": {
+              "type": "doc",
+              "version": 1,
+              "content": [{
+                "type": "paragraph",
+                "content": [{"type": "text", "text": $desc}]
+              }]
+            }
+          }')
+
+          response=$(post_jira_comment "3" "$adf_payload")
+          http_code="${response: -3}"
+
+          if [ "$http_code" = "201" ]; then
+            echo "✅ Posted to Jira issue $KEY"
+          else
+            echo "⚠️ ADF format failed, trying simple text..."
+            # Fallback to simple format (API v2)
+            simple_payload=$(jq -n --arg desc "$escaped_desc" '{"body": $desc}')
+            fallback_response=$(post_jira_comment "2" "$simple_payload")
+            fallback_code="${fallback_response: -3}"
+            
+            if [ "$fallback_code" = "201" ]; then
+              echo "✅ Posted to Jira issue $KEY (fallback format)"
+            else
+              echo "⚠️ Failed to post to Jira, continuing workflow"
+            fi
+          fi
+
+      - name: Cleanup
+        if: always()
+        run: rm -f diff.txt diff_batch_* batch_summaries.txt
+
+      - name: Summary
+        if: steps.changes.outputs.has_changes == 'true'
+        run: |
+          echo "🎉 AI PR workflow complete!"
+          echo "✅ PR description updated"
+          echo "✅ Test scenarios posted"
+          echo "✅ Jira integration attempted"
+
